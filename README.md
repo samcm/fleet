@@ -12,6 +12,8 @@ fleet result <id>       # latest reply + footer
 fleet say <id> <msg>    # follow-up on the same live session (queues if busy)
 fleet stop <id>
 fleet log <id> [--tail N]
+fleet wait <id> [--timeout 1800]    # block until final; prints the entry; exit 3 on timeout — the caller's one wake-up
+fleet watch [ids...] [--timeout 3600]  # one line per state change or flag; exits when all watched are final
 fleet mcp               # MCP over stdio: fleet_spawn fleet_ls fleet_result fleet_say fleet_stop fleet_log
 ```
 
