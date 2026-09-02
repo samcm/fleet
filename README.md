@@ -19,4 +19,4 @@ fleet mcp               # MCP over stdio: fleet_spawn fleet_ls fleet_result flee
 
 States: STARTING RUNNING DONE TIMEOUT STOPPED FAILED QUOTA. Read-only workers run omp with `--approval-mode always-ask` and edit/delete/move permission requests are refused; writing workers run `yolo`. Each turn gets the `--minutes` budget and the brief carries the hard-stop time.
 
-Agents live in `~/.fleet/agents.json` (`{"name": {"argv": [...], "env": [...], "bare": false}}`) overlaid on the built-in `omp` and `oracle`. Per-worker files: `~/.fleet/workers/<id>/{meta.json,brief.md,events.jsonl,resultN.md,stderr.log}`.
+Agents live in `~/.fleet/agents.json` (`{"name": {"argv": [...], "env": [...], "bare": false}}`) overlaid on the built-in `omp` and `oracle`. Shared prompt files: `~/.fleet/rules.md` (appended to every omp worker), `~/.fleet/bare.md` and `bare.yml` (oracle system prompt and config overlay). Per-worker files: `~/.fleet/workers/<id>/{meta.json,brief.md,events.jsonl,resultN.md,stderr.log}`.
