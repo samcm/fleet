@@ -114,10 +114,14 @@ func root() *cobra.Command {
 			return client.Say(ctx, args[0], strings.Join(args[1:], " "))
 		}),
 	})
-	cmd.AddCommand(&cobra.Command{
-		Use: "result <id>", Short: "latest reply and footer", Args: cobra.ExactArgs(1),
-		RunE: withDaemon(func(_ *cobra.Command, args []string) (string, error) { return client.Result(ctx, args[0]) }),
-	})
+	var resultTurn string
+
+	resultCmd := &cobra.Command{
+		Use: "result <id>", Short: "reply text and footer", Args: cobra.ExactArgs(1),
+		RunE: withDaemon(func(_ *cobra.Command, args []string) (string, error) { return client.Result(ctx, args[0], resultTurn) }),
+	}
+	resultCmd.Flags().StringVar(&resultTurn, "turn", "", "turn to read: a number for an earlier turn, all for every turn")
+	cmd.AddCommand(resultCmd)
 	cmd.AddCommand(&cobra.Command{
 		Use: "stop <id>", Short: "end a worker", Args: cobra.ExactArgs(1),
 		RunE: withDaemon(func(_ *cobra.Command, args []string) (string, error) { return client.Stop(ctx, args[0]) }),

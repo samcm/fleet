@@ -374,15 +374,23 @@ func (d *Daemon) handleResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	m := wk.Meta()
-	text := wk.Result()
 
-	if m.State == StateRunning || m.State == StateStarting {
-		_, _ = fmt.Fprintf(w, "%s is still %s; partial output so far:\n\n%s\n", m.ID, m.State, text)
+	text, err := wk.ResultTurn(r.URL.Query().Get("turn"))
+	if err != nil {
+		writeErr(w, 400, err)
 
 		return
 	}
 
-	_, _ = fmt.Fprintf(w, "%s\n\n---- fleet ----\n%s", text, d.Ls(true, m.ID))
+	footer := fmt.Sprintf("---- fleet ----\n%s%s\n", d.Ls(true, m.ID), wk.TurnsLine())
+
+	if m.State == StateRunning || m.State == StateStarting {
+		_, _ = fmt.Fprintf(w, "%s is still %s; partial output so far:\n\n%s\n\n%s", m.ID, m.State, text, footer)
+
+		return
+	}
+
+	_, _ = fmt.Fprintf(w, "%s\n\n%s", text, footer)
 }
 
 func (d *Daemon) handleStop(w http.ResponseWriter, r *http.Request) {

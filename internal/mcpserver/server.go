@@ -27,6 +27,11 @@ type idInput struct {
 	ID string `json:"id" jsonschema:"worker id from fleet_spawn or fleet_ls, like w-1a2b3c"`
 }
 
+type resultInput struct {
+	ID   string `json:"id" jsonschema:"worker id"`
+	Turn string `json:"turn,omitempty" jsonschema:"which turn's reply: empty or 0 for the latest (live while running), a turn number for an earlier one, or all for every turn concatenated"`
+}
+
 type sayInput struct {
 	ID      string `json:"id" jsonschema:"worker id"`
 	Message string `json:"message" jsonschema:"follow-up prompt for the same session: a correction, a review to act on, or 'continue'"`
@@ -89,10 +94,11 @@ func Run(ctx context.Context, home string) error {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "fleet_result",
-		Description: "The worker's latest reply in full, followed by a footer with its final state, usage and detail. While it is still running you get the partial output so far.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in idInput) (*mcp.CallToolResult, any, error) {
-		return text(client.Result(ctx, in.ID))
+		Name: "fleet_result",
+		Description: "A worker's reply in full, followed by a footer with its state, usage and the list of turns. " +
+			"While it is still running you get the partial output so far. Earlier turns stay readable: pass turn=N for one or turn=all for every turn.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in resultInput) (*mcp.CallToolResult, any, error) {
+		return text(client.Result(ctx, in.ID, in.Turn))
 	})
 
 	mcp.AddTool(server, &mcp.Tool{

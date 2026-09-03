@@ -301,9 +301,16 @@ func (c *Client) Say(ctx context.Context, id, message string) (string, error) {
 	return c.post(ctx, "/say", map[string]string{"id": id, "message": message})
 }
 
-// Result returns a worker's latest reply and footer.
-func (c *Client) Result(ctx context.Context, id string) (string, error) {
-	return c.get(ctx, "/result", url.Values{"id": {id}})
+// Result returns a worker's reply text and footer. turn selects the reply:
+// empty or "0" for the latest turn (live while running), a turn number for an
+// earlier one, or "all" for every turn concatenated.
+func (c *Client) Result(ctx context.Context, id, turn string) (string, error) {
+	q := url.Values{"id": {id}}
+	if turn != "" {
+		q.Set("turn", turn)
+	}
+
+	return c.get(ctx, "/result", q)
 }
 
 // Stop ends a worker.
