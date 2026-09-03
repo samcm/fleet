@@ -12,10 +12,12 @@ fleet result <id> [--turn N|--turn all]   # latest reply + footer; --turn N read
 fleet say <id> <msg>    # follow-up on the same live session (queues if busy)
 fleet stop <id>
 fleet log <id> [--tail N]
-fleet wait <id> [--timeout 1800]    # block until final; prints the entry; exit 3 on timeout — the caller's one wake-up
+fleet wait <id> [--timeout 1800]    # block until final; prints the entry; exit 3 on timeout — run it as a background shell command to be woken when the worker is final
 fleet watch [ids...] [--timeout 3600]  # one line per state change or flag; exits when all watched are final
-fleet mcp               # MCP over stdio: fleet_spawn fleet_ls fleet_result fleet_say fleet_stop fleet_log
+fleet mcp               # MCP over stdio: fleet_spawn fleet_ls fleet_result fleet_say fleet_stop fleet_log fleet_wait
 ```
+
+Nothing is pushed to the caller, so the wake-up path is `fleet wait <id> --timeout 5400` run as a background shell command: it exits when the worker is final (exit 3 on timeout), and the shell notifies you. Inside a tool call, `fleet_wait {id, seconds}` does the same for up to 240 seconds and returns the ls entry or "still running".
 
 States: STARTING RUNNING DONE TIMEOUT STOPPED FAILED QUOTA. Read-only workers run omp with `--approval-mode always-ask` and edit/delete/move permission requests are refused; writing workers run `yolo`. Each turn gets the `--minutes` budget and the brief carries the hard-stop time. The agent's `usage_update` notifications are tracked live: `fleet ls` shows the context window fill and cumulative session cost (`ctx 177k/1.0M $7.09`) next to the per-turn token totals, and the result footer carries the same line.
 

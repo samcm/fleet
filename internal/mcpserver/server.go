@@ -3,8 +3,10 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -46,6 +48,11 @@ type logInput struct {
 	Tail int    `json:"tail,omitempty" jsonschema:"number of recent events to show (default 30)"`
 }
 
+type waitInput struct {
+	ID      string `json:"id" jsonschema:"worker id"`
+	Seconds int    `json:"seconds,omitempty" jsonschema:"how long to block for the worker to finish, capped at 240 (default 60)"`
+}
+
 // Run serves MCP over stdio until the client disconnects.
 func Run(ctx context.Context, home string) error {
 	client := fleet.NewClient(home)
@@ -67,7 +74,8 @@ func Run(ctx context.Context, home string) error {
 		Name: "fleet_spawn",
 		Description: "Start one headless coding-agent worker on the given model and return its id. The worker runs on its own; " +
 			"nothing is pushed back to you. Check on it with fleet_ls, read its reply with fleet_result, steer it with fleet_say, end it with fleet_stop. " +
-			"A worker that dies at launch (bad model, quota, auth) shows FAILED or QUOTA in fleet_ls within seconds.",
+			"A worker that dies at launch (bad model, quota, auth) shows FAILED or QUOTA in fleet_ls within seconds. " +
+			"To be woken when it finishes, run `fleet wait <id> --timeout 5400` as a background shell command; it exits when the worker is final.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in spawnInput) (*mcp.CallToolResult, any, error) {
 		brief := in.Brief
 		if in.BriefPath != "" {
@@ -121,6 +129,26 @@ func Run(ctx context.Context, home string) error {
 		Description: "The worker's recent events: tool calls with durations, permission decisions, turn ends, process exit. Use it when fleet_ls looks wrong before deciding to stop.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in logInput) (*mcp.CallToolResult, any, error) {
 		return text(client.Log(ctx, in.ID, in.Tail))
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "fleet_wait",
+		Description: "Block until the worker is final or seconds pass (capped at 240), then return its fleet_ls entry, or \"still running\". " +
+			"For anything longer, run `fleet wait <id> --timeout 5400` as a background shell command instead: it exits the moment the worker is final, which wakes you.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in waitInput) (*mcp.CallToolResult, any, error) {
+		seconds := in.Seconds
+		if seconds <= 0 {
+			seconds = 60
+		}
+
+		seconds = min(seconds, 240)
+
+		entry, err := client.Wait(ctx, in.ID, time.Duration(seconds)*time.Second)
+		if errors.Is(err, fleet.ErrStillRunning) {
+			return text(fmt.Sprintf("%s still running after %ds\n%s", in.ID, seconds, entry), nil)
+		}
+
+		return text(entry, err)
 	})
 
 	return server.Run(ctx, &mcp.StdioTransport{})

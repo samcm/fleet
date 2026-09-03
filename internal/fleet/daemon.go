@@ -140,7 +140,7 @@ func (d *Daemon) handleSpawn(w http.ResponseWriter, r *http.Request) {
 
 	time.Sleep(1500 * time.Millisecond)
 
-	_, _ = fmt.Fprintf(w, "spawned %s\n%s", id, d.Ls(false, id))
+	_, _ = fmt.Fprintf(w, "spawned %s\n%sTo be woken when it finishes, run `fleet wait %s --timeout 5400` as a background shell command; it exits when the worker is final.\n", id, d.Ls(false, id), id)
 }
 
 // Spawn validates the spec and starts a worker.
