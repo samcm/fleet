@@ -57,7 +57,12 @@ type Meta struct {
 	Turns     int        `json:"turns"`
 	TurnLog   []TurnInfo `json:"turn_log,omitempty"`
 	Usage     Usage      `json:"usage"`
-	Ended     time.Time  `json:"ended,omitempty"`
+	// ContextUsed and ContextSize are the agent's latest reported context
+	// window fill in tokens; CostUSD is the latest reported session cost.
+	ContextUsed int64     `json:"context_used,omitempty"`
+	ContextSize int64     `json:"context_size,omitempty"`
+	CostUSD     float64   `json:"cost_usd,omitempty"`
+	Ended       time.Time `json:"ended,omitempty"`
 }
 
 // TurnInfo records how one turn ended so past turns stay listable after the
@@ -429,7 +434,13 @@ func (w *Worker) onNotification(n acp.Notification) {
 			Title         string `json:"title"`
 			Kind          string `json:"kind"`
 			Status        string `json:"status"`
-			Content       json.RawMessage
+			Used          int64  `json:"used"`
+			Size          int64  `json:"size"`
+			Cost          *struct {
+				Amount   float64 `json:"amount"`
+				Currency string  `json:"currency"`
+			} `json:"cost"`
+			Content json.RawMessage
 		} `json:"update"`
 	}
 
@@ -472,7 +483,17 @@ func (w *Worker) onNotification(n acp.Notification) {
 			w.lastText = tailString(w.turnText.String(), 200)
 		}
 	case "usage_update":
-		w.event("usage", map[string]any{"raw": json.RawMessage(n.Params)})
+		// used/size are the context window fill; cost.amount is the cumulative
+		// session cost so far, so the latest update replaces the stored values.
+		w.meta.ContextUsed = u.Used
+		w.meta.ContextSize = u.Size
+
+		if u.Cost != nil {
+			w.meta.CostUSD = u.Cost.Amount
+		}
+
+		w.saveMeta()
+		w.event("usage", map[string]any{"used": u.Used, "size": u.Size, "cost_usd": w.meta.CostUSD})
 	}
 }
 

@@ -311,6 +311,14 @@ func (d *Daemon) Ls(all bool, only string) string {
 		}
 
 		tok := fmt.Sprintf("tok in %s cached %s out %s", human(m.Usage.Input), human(m.Usage.CachedRead), human(m.Usage.Output))
+		if m.ContextUsed > 0 || m.ContextSize > 0 {
+			tok += fmt.Sprintf(" ctx %s/%s", human(m.ContextUsed), human(m.ContextSize))
+		}
+
+		if m.CostUSD > 0 {
+			tok += fmt.Sprintf(" $%.2f", m.CostUSD)
+		}
+
 		if m.Turns > 1 {
 			tok += fmt.Sprintf(", turn %d", m.Turns)
 		}
@@ -330,7 +338,7 @@ func human(n int64) string {
 	case n >= 1_000_000:
 		return fmt.Sprintf("%.1fM", float64(n)/1e6)
 	case n >= 1_000:
-		return fmt.Sprintf("%dk", n/1000)
+		return fmt.Sprintf("%dk", (n+500)/1000)
 	default:
 		return strconv.FormatInt(n, 10)
 	}
