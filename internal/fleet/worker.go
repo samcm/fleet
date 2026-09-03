@@ -63,6 +63,13 @@ type Meta struct {
 	ContextSize int64     `json:"context_size,omitempty"`
 	CostUSD     float64   `json:"cost_usd,omitempty"`
 	Ended       time.Time `json:"ended,omitempty"`
+	// Restart survival: AckSeq is the host stream position handled so far,
+	// NextRPCID keeps request ids unique across reattaches, and TurnCallID
+	// with TurnDeadline describe the in-flight prompt call to resume.
+	AckSeq       int64     `json:"ack_seq,omitempty"`
+	NextRPCID    int64     `json:"next_rpc_id,omitempty"`
+	TurnCallID   int64     `json:"turn_call_id,omitempty"`
+	TurnDeadline time.Time `json:"turn_deadline,omitempty"`
 }
 
 // TurnInfo records how one turn ended so past turns stay listable after the
@@ -86,12 +93,13 @@ type toolCall struct {
 	Started time.Time
 }
 
-// Worker owns one ACP agent process and its session.
+// Worker owns one ACP agent session, reached through the worker's host.
 type Worker struct {
-	dir    string
-	agent  Agent
-	logger *slog.Logger
-	home   string
+	dir      string
+	agent    Agent
+	logger   *slog.Logger
+	home     string
+	hostArgv []string
 
 	mu         sync.Mutex
 	meta       Meta
@@ -102,6 +110,7 @@ type Worker struct {
 	inFlight   map[string]toolCall
 	recent     []string
 	turnText   strings.Builder
+	turnFile   *os.File
 	lastText   string
 	pendingSay string
 	stderrPath string
@@ -111,7 +120,7 @@ type Worker struct {
 
 var quotaPattern = regexp.MustCompile(`(?i)usage limit|out of credits|need a Grok subscription|insufficient_quota|billing|rate.?limit`)
 
-func newWorker(dir string, meta Meta, agent Agent, home string, logger *slog.Logger) (*Worker, error) {
+func newWorker(dir string, meta Meta, agent Agent, home string, hostArgv []string, logger *slog.Logger) (*Worker, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -126,6 +135,7 @@ func newWorker(dir string, meta Meta, agent Agent, home string, logger *slog.Log
 		agent:      agent,
 		logger:     logger.With(slog.String("worker", meta.ID)),
 		home:       home,
+		hostArgv:   hostArgv,
 		meta:       meta,
 		inFlight:   make(map[string]toolCall),
 		stderrPath: filepath.Join(dir, "stderr.log"),
@@ -198,7 +208,9 @@ func (w *Worker) start(ctx context.Context) error {
 		argv = append(argv, "--approval-mode", mode)
 	}
 
-	client, err := acp.Start(context.Background(), argv, w.agent.Env, cwd, w.stderrPath)
+	hostArgv := append(append([]string(nil), w.hostArgv...), w.dir)
+
+	client, err := acp.Launch(hostArgv, w.dir, acp.LaunchSpec{Argv: argv, Env: w.agent.Env, Cwd: cwd, StderrPath: w.stderrPath})
 	if err != nil {
 		return w.fail(StateFailed, err.Error())
 	}
@@ -253,7 +265,9 @@ func (w *Worker) start(ctx context.Context) error {
 	return nil
 }
 
-// prompt starts one turn. The budget applies per turn.
+// prompt starts one turn. The budget applies per turn. The in-flight call's
+// id and deadline are persisted before the prompt is sent so a restarted
+// daemon can resume the same call.
 func (w *Worker) prompt(text string) {
 	w.mu.Lock()
 
@@ -263,7 +277,11 @@ func (w *Worker) prompt(text string) {
 		return
 	}
 
-	turnCtx, cancel := context.WithTimeout(context.Background(), time.Duration(w.meta.Spec.Minutes)*time.Minute)
+	client := w.client
+	callID := client.Reserve()
+	deadline := time.Now().Add(time.Duration(w.meta.Spec.Minutes) * time.Minute)
+	turnCtx, cancel := context.WithDeadline(context.Background(), deadline)
+
 	w.turnCancel = cancel
 	w.turnStart = time.Now()
 	w.lastEvent = time.Time{}
@@ -273,77 +291,138 @@ func (w *Worker) prompt(text string) {
 	w.meta.State = StateRunning
 	w.meta.Detail = ""
 	w.meta.Turns++
+	w.meta.TurnCallID = callID
+	w.meta.TurnDeadline = deadline
+	w.meta.NextRPCID = callID
 	sessionID := w.meta.SessionID
-	client := w.client
+	turn := w.meta.Turns
 	w.saveMeta()
 	w.mu.Unlock()
 
 	w.event("prompt", map[string]any{"chars": len(text)})
-	_ = os.WriteFile(filepath.Join(w.dir, fmt.Sprintf("prompt%d.md", w.meta.Turns)), []byte(text), 0o644)
+	_ = os.WriteFile(filepath.Join(w.dir, fmt.Sprintf("prompt%d.md", turn)), []byte(text), 0o644)
+
+	// The turn's reply accumulates in resultN.md as chunks arrive, so a
+	// reattached daemon reloads it instead of losing the pre-restart text.
+	turnFile, err := os.OpenFile(filepath.Join(w.dir, fmt.Sprintf("result%d.md", turn)), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err == nil {
+		w.mu.Lock()
+		w.turnFile = turnFile
+		w.mu.Unlock()
+	}
 
 	if !w.agent.Bare {
 		text += deadlineNote(w.meta.Spec.Minutes)
 	}
 
-	go func() {
-		defer cancel()
+	go w.runTurn(turnCtx, cancel, callID, sessionID, text)
+}
 
-		var res struct {
-			StopReason string `json:"stopReason"`
-			Usage      *struct {
-				InputTokens      int64 `json:"inputTokens"`
-				OutputTokens     int64 `json:"outputTokens"`
-				CachedReadTokens int64 `json:"cachedReadTokens"`
-			} `json:"usage"`
-		}
+// promptResult is the answer to one session/prompt call.
+type promptResult struct {
+	StopReason string `json:"stopReason"`
+	Usage      *struct {
+		InputTokens      int64 `json:"inputTokens"`
+		OutputTokens     int64 `json:"outputTokens"`
+		CachedReadTokens int64 `json:"cachedReadTokens"`
+	} `json:"usage"`
+}
 
-		err := client.Call(turnCtx, "session/prompt", map[string]any{
+// runTurn waits for one prompt call to end and finishes the turn. A non-empty
+// text sends a fresh prompt; an empty one resumes the call sent before a
+// daemon restart.
+func (w *Worker) runTurn(ctx context.Context, cancel context.CancelFunc, callID int64, sessionID, text string) {
+	defer cancel()
+
+	client := w.client
+	res := &promptResult{}
+
+	_ = client.Expect(callID)
+
+	var err error
+	var ackSeq int64
+
+	if text != "" {
+		if err = client.Send(callID, "session/prompt", map[string]any{
 			"sessionId": sessionID,
 			"prompt":    []map[string]string{{"type": "text", "text": text}},
-		}, &res)
-
-		w.mu.Lock()
-		defer w.mu.Unlock()
-
-		if res.Usage != nil {
-			w.meta.Usage.Input += res.Usage.InputTokens
-			w.meta.Usage.Output += res.Usage.OutputTokens
-			w.meta.Usage.CachedRead += res.Usage.CachedReadTokens
+		}); err != nil {
+			err = fmt.Errorf("session/prompt: write: %w", err)
 		}
+	}
 
-		switch {
-		case errors.Is(err, context.DeadlineExceeded):
-			w.meta.State = StateTimeout
-			w.meta.Detail = fmt.Sprintf("hit the %d minute budget; reply below is what the turn produced so far", w.meta.Spec.Minutes)
-			_ = client.Notify("session/cancel", map[string]any{"sessionId": sessionID})
-		case errors.Is(err, context.Canceled):
-			w.meta.State = StateStopped
-			w.meta.Detail = "stopped by request"
-		case errors.Is(err, acp.ErrClosed):
-			w.meta.State = StateFailed
-			w.meta.Detail = "agent process exited mid-turn"
-			w.classifyExit()
-		case err != nil:
-			w.meta.State = StateFailed
-			w.meta.Detail = err.Error()
-		default:
-			w.meta.State = StateDone
-			w.meta.Detail = "stopReason " + res.StopReason
+	if err == nil {
+		ackSeq, err = client.AwaitCall(ctx, callID, res)
+		if err != nil && !errors.Is(err, acp.ErrClosed) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("session/prompt: %w", err)
 		}
+	}
 
-		w.meta.Ended = time.Now()
-		w.event("turn_end", map[string]any{"state": string(w.meta.State), "detail": w.meta.Detail})
+	w.finishTurn(callID, ackSeq, err, res, sessionID)
+}
+
+// finishTurn records the end of the current turn and starts a queued one.
+func (w *Worker) finishTurn(callID, ackSeq int64, err error, res *promptResult, sessionID string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if errors.Is(err, acp.ErrClosed) && !w.client.Exited() {
+		// The daemon lost or handed over the host link without the agent
+		// exiting; the next daemon resumes this turn from meta.
+		return
+	}
+
+	if res.Usage != nil {
+		w.meta.Usage.Input += res.Usage.InputTokens
+		w.meta.Usage.Output += res.Usage.OutputTokens
+		w.meta.Usage.CachedRead += res.Usage.CachedReadTokens
+	}
+
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		w.meta.State = StateTimeout
+		w.meta.Detail = fmt.Sprintf("hit the %d minute budget; reply below is what the turn produced so far", w.meta.Spec.Minutes)
+		_ = w.client.Notify("session/cancel", map[string]any{"sessionId": sessionID})
+	case errors.Is(err, context.Canceled):
+		w.meta.State = StateStopped
+		w.meta.Detail = "stopped by request"
+	case errors.Is(err, acp.ErrClosed):
+		w.meta.State = StateFailed
+		w.meta.Detail = "agent process exited mid-turn"
+		w.classifyExit()
+	case err != nil:
+		w.meta.State = StateFailed
+		w.meta.Detail = err.Error()
+	default:
+		w.meta.State = StateDone
+		w.meta.Detail = "stopReason " + res.StopReason
+	}
+
+	if ackSeq > w.meta.AckSeq {
+		w.meta.AckSeq = ackSeq
+	}
+
+	w.meta.TurnCallID = 0
+	w.meta.TurnDeadline = time.Time{}
+	w.meta.Ended = time.Now()
+	w.event("turn_end", map[string]any{"state": string(w.meta.State), "detail": w.meta.Detail})
+
+	if w.turnFile != nil {
+		_ = w.turnFile.Close()
+		w.turnFile = nil
+	} else {
 		_ = os.WriteFile(filepath.Join(w.dir, fmt.Sprintf("result%d.md", w.meta.Turns)), []byte(w.turnText.String()), 0o644)
-		w.meta.TurnLog = append(w.meta.TurnLog, TurnInfo{State: w.meta.State, Chars: w.turnText.Len()})
-		w.saveMeta()
+	}
 
-		if w.pendingSay != "" && w.meta.State == StateDone {
-			next := w.pendingSay
-			w.pendingSay = ""
+	w.meta.TurnLog = append(w.meta.TurnLog, TurnInfo{State: w.meta.State, Chars: w.turnText.Len()})
+	w.saveMeta()
 
-			go w.prompt(next)
-		}
-	}()
+	if w.pendingSay != "" && w.meta.State == StateDone {
+		next := w.pendingSay
+		w.pendingSay = ""
+
+		go w.prompt(next)
+	}
 }
 
 func deadlineNote(minutes int) string {
@@ -365,23 +444,115 @@ func (w *Worker) eventLoop() {
 	for {
 		select {
 		case n, ok := <-client.Notifications():
-			if !ok {
-				w.onExit()
+			if !ok || client.Detached() {
+				w.onConnEnd()
 
 				return
 			}
 
 			w.onNotification(n)
+			w.ack(n.Seq)
 		case req, ok := <-client.Requests():
-			if !ok {
-				w.onExit()
+			if !ok || client.Detached() {
+				w.onConnEnd()
 
 				return
 			}
 
 			w.onRequest(req)
+			w.ack(req.Seq)
 		}
 	}
+}
+
+// ack persists the host stream position after a message has been handled, so
+// a restarted daemon replays only what this worker never saw.
+func (w *Worker) ack(seq int64) {
+	if seq <= 0 {
+		return
+	}
+
+	w.mu.Lock()
+
+	if seq > w.meta.AckSeq {
+		w.meta.AckSeq = seq
+		w.saveMeta()
+	}
+
+	w.mu.Unlock()
+}
+
+// attach reconnects a worker whose host outlived the previous daemon. The
+// in-flight turn, if any, resumes with its remaining budget.
+func (w *Worker) attach(client *acp.Client) {
+	w.mu.Lock()
+	w.client = client
+	client.SetNextID(w.meta.NextRPCID)
+
+	callID := w.meta.TurnCallID
+	deadline := w.meta.TurnDeadline
+	sessionID := w.meta.SessionID
+
+	if callID != 0 {
+		// Reload the reply accumulated before the restart, then keep appending.
+		resultPath := filepath.Join(w.dir, fmt.Sprintf("result%d.md", w.meta.Turns))
+		if b, err := os.ReadFile(resultPath); err == nil {
+			w.turnText.Write(b)
+			w.lastText = tailString(w.turnText.String(), 200)
+		}
+
+		if f, err := os.OpenFile(resultPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			w.turnFile = f
+		}
+
+		w.turnStart = time.Now()
+	}
+
+	w.mu.Unlock()
+
+	w.event("reattached", map[string]any{"ack_seq": w.meta.AckSeq})
+	w.logger.Info("reattached to worker host", slog.Int64("ack_seq", w.meta.AckSeq))
+
+	go w.eventLoop()
+
+	if callID != 0 {
+		turnCtx, cancel := context.WithDeadline(context.Background(), deadline)
+
+		w.mu.Lock()
+		w.turnCancel = cancel
+		w.mu.Unlock()
+
+		go w.runTurn(turnCtx, cancel, callID, sessionID, "")
+	}
+}
+
+// detach drops the host connection when the daemon shuts down; the agent
+// keeps running for the next daemon to resume.
+func (w *Worker) detach() {
+	w.mu.Lock()
+	client := w.client
+	w.mu.Unlock()
+
+	if client != nil {
+		client.Close()
+	}
+}
+
+// onConnEnd handles the host link ending: the agent's exit is final; anything
+// else means the daemon lost or handed over the link and must go quiet
+// without touching the persisted state.
+func (w *Worker) onConnEnd() {
+	if w.client.Exited() {
+		w.onExit()
+
+		return
+	}
+
+	w.mu.Lock()
+	w.closed = true
+	w.mu.Unlock()
+
+	w.event("detached", nil)
 }
 
 func (w *Worker) onExit() {
@@ -479,6 +650,10 @@ func (w *Worker) onNotification(n acp.Notification) {
 
 		if err := json.Unmarshal(u.Content, &c); err == nil && c.Text != "" {
 			w.turnText.WriteString(c.Text)
+
+			if w.turnFile != nil {
+				_, _ = w.turnFile.WriteString(c.Text)
+			}
 
 			w.lastText = tailString(w.turnText.String(), 200)
 		}

@@ -156,6 +156,25 @@ var ErrStillRunning = errors.New("still running")
 // under the HTTP client timeout so a poll always returns 200 or 202.
 const waitPollStep = 45 * time.Second
 
+// WaitOnce issues one long poll against the wait endpoint: final is true when
+// the worker reached a final state within seconds. The body is the ls entry.
+func (c *Client) WaitOnce(ctx context.Context, id string, seconds int) (entry string, final bool, err error) {
+	seconds = max(1, min(seconds, 300))
+	q := url.Values{"id": {id}, "timeout": {fmt.Sprint(seconds)}}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://fleet/wait?"+q.Encode(), nil)
+	if err != nil {
+		return "", false, err
+	}
+
+	body, code, err := c.doStatus(req)
+	if err != nil {
+		return "", false, err
+	}
+
+	return body, code == http.StatusOK, nil
+}
+
 // Wait blocks until the worker is final or timeout passes, returning its ls entry.
 func (c *Client) Wait(ctx context.Context, id string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
@@ -172,19 +191,13 @@ func (c *Client) Wait(ctx context.Context, id string, timeout time.Duration) (st
 		// the client cancels it and the wait ends with a transport error.
 		step := min(left, waitPollStep)
 		seconds := max(1, int(math.Ceil(step.Seconds())))
-		q := url.Values{"id": {id}, "timeout": {fmt.Sprint(seconds)}}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://fleet/wait?"+q.Encode(), nil)
+		body, final, err := c.WaitOnce(ctx, id, seconds)
 		if err != nil {
 			return "", err
 		}
 
-		body, code, err := c.doStatus(req)
-		if err != nil {
-			return "", err
-		}
-
-		if code == http.StatusOK {
+		if final {
 			return body, nil
 		}
 	}

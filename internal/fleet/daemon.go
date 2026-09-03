@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/samcm/fleet/internal/acp"
 )
 
 // Root returns ~/.fleet.
@@ -27,28 +29,36 @@ func SocketPath(home string) string { return filepath.Join(Root(home), "fleet.so
 
 // Daemon owns the live workers and serves them over a unix socket.
 type Daemon struct {
-	home   string
-	logger *slog.Logger
-	agents map[string]Agent
+	home     string
+	logger   *slog.Logger
+	agents   map[string]Agent
+	hostArgv []string
 
 	mu      sync.Mutex
 	workers map[string]*Worker
 	history map[string]Meta
 }
 
-// NewDaemon loads agent definitions and the metadata of past workers.
+// NewDaemon loads agent definitions and the metadata of past workers, then
+// reattaches every worker whose host process outlived the previous daemon.
 func NewDaemon(home string, logger *slog.Logger) (*Daemon, error) {
 	agents, err := LoadAgents(home)
 	if err != nil {
 		return nil, err
 	}
 
+	self, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+
 	d := &Daemon{
-		home:    home,
-		logger:  logger.WithGroup("fleet"),
-		agents:  agents,
-		workers: make(map[string]*Worker),
-		history: make(map[string]Meta),
+		home:     home,
+		logger:   logger.WithGroup("fleet"),
+		agents:   agents,
+		hostArgv: []string{self, "host"},
+		workers:  make(map[string]*Worker),
+		history:  make(map[string]Meta),
 	}
 
 	entries, _ := os.ReadDir(filepath.Join(Root(home), "workers"))
@@ -59,17 +69,87 @@ func NewDaemon(home string, logger *slog.Logger) (*Daemon, error) {
 		}
 
 		var m Meta
-		if json.Unmarshal(b, &m) == nil {
-			if !m.State.Terminal() {
-				m.State = StateFailed
-				m.Detail = "daemon restarted while the worker was running"
-			}
+		if json.Unmarshal(b, &m) != nil {
+			continue
+		}
 
+		switch m.State {
+		case StateRunning, StateDone, StateTimeout, StateStarting:
+			// The agent may have outlived the previous daemon inside its host.
+			d.resume(m)
+		default:
 			d.history[m.ID] = m
 		}
 	}
 
 	return d, nil
+}
+
+// resume returns a worker whose agent may have outlived the previous daemon
+// to the live set, attaching to its host when one answers.
+func (d *Daemon) resume(m Meta) {
+	dir := filepath.Join(Root(d.home), "workers", m.ID)
+
+	agent, ok := d.agents[m.Spec.Agent]
+	if !ok {
+		d.failResume(dir, m, "agent "+m.Spec.Agent+" is no longer defined")
+
+		return
+	}
+
+	switch {
+	case m.State == StateStarting:
+		// The launch handshake does not resume; the session may never have
+		// been established.
+		d.failResume(dir, m, "daemon restarted while the worker was starting")
+	case m.State == StateRunning && m.TurnCallID == 0:
+		d.failResume(dir, m, "daemon restarted while the worker was running")
+	default:
+		var expect []int64
+		if m.TurnCallID != 0 {
+			expect = []int64{m.TurnCallID}
+		}
+
+		client, err := acp.Attach(dir, m.AckSeq, expect...)
+		if err != nil {
+			if m.State == StateRunning {
+				d.failResume(dir, m, "daemon restarted while the worker was running")
+
+				return
+			}
+
+			// A finished worker whose host is gone has nothing to resume.
+			d.history[m.ID] = m
+
+			return
+		}
+
+		wk, err := newWorker(dir, m, agent, d.home, d.hostArgv, d.logger)
+		if err != nil {
+			client.Close()
+			d.failResume(dir, m, err.Error())
+
+			return
+		}
+
+		wk.attach(client)
+
+		d.workers[m.ID] = wk
+	}
+}
+
+// failResume marks a worker FAILED because the daemon lost it, and persists
+// the verdict so a later restart does not try to attach again.
+func (d *Daemon) failResume(dir string, m Meta, detail string) {
+	m.State = StateFailed
+	m.Detail = detail
+	m.Ended = time.Now()
+
+	if b, err := json.MarshalIndent(m, "", "  "); err == nil {
+		_ = os.WriteFile(filepath.Join(dir, "meta.json"), b, 0o644)
+	}
+
+	d.history[m.ID] = m
 }
 
 // Serve listens on the unix socket until ctx is cancelled.
@@ -115,6 +195,14 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+
+	// The daemon is going away; drop every host link so the workers go quiet
+	// and the next daemon resumes them.
+	d.mu.Lock()
+	for _, wk := range d.workers {
+		wk.detach()
+	}
+	d.mu.Unlock()
 
 	return nil
 }
@@ -185,7 +273,7 @@ func (d *Daemon) Spawn(ctx context.Context, spec Spec) (string, error) {
 	id := newID()
 	meta := Meta{ID: id, Spec: spec, Started: time.Now(), State: StateStarting}
 
-	wk, err := newWorker(filepath.Join(Root(d.home), "workers", id), meta, agent, d.home, d.logger)
+	wk, err := newWorker(filepath.Join(Root(d.home), "workers", id), meta, agent, d.home, d.hostArgv, d.logger)
 	if err != nil {
 		return "", err
 	}

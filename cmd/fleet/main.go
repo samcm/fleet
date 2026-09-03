@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/samcm/fleet/internal/acp"
 	"github.com/samcm/fleet/internal/fleet"
 	"github.com/samcm/fleet/internal/mcpserver"
 )
@@ -51,6 +52,16 @@ func root() *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use: "mcp", Short: "serve MCP over stdio (for Claude Code)",
 		RunE: func(cmd *cobra.Command, _ []string) error { return mcpserver.Run(ctx, home) },
+	})
+
+	cmd.AddCommand(&cobra.Command{
+		Use: "host <workerdir>", Short: "run the host process for one worker (internal)", Hidden: true, Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			return acp.ServeHost(ctx, args[0])
+		},
 	})
 
 	client := fleet.NewClient(home)
