@@ -1,6 +1,6 @@
 # fleet
 
-Headless coding-agent workers over the [Agent Client Protocol](https://agentclientprotocol.com), driven from Claude Code as MCP tools or from a shell as a CLI.
+Headless coding-agent workers over the [Agent Client Protocol](https://agentclientprotocol.com), for a coding agent to drive: Claude Code reaches them as MCP tools, or as a CLI through its shell.
 
 One worker is one agent process on the model you name, held by a daemon that outlives the session that spawned it. State comes from the ACP event stream, not from parsing transcripts, so `fleet ls` shows what a worker is doing now. Nothing is pushed to you; you ask.
 
@@ -12,15 +12,21 @@ fleet gives one Claude Code session a set of long-lived workers on whatever mode
 
 ## How I use it
 
-Almost always the same loop, from the CLI rather than the MCP tools:
+I never run these commands. Claude Code does, and I talk to Claude.
 
-1. Split a PRD into numbered pieces. Two vendors critique the PRD first if it is load-bearing.
-2. One writing worker per piece, on a strong builder at `xhigh` or `max`, with a 90 to 120 minute budget.
-3. `fleet wait` in the background as the wake-up, then `fleet ls` when I want to know.
-4. A read-only reviewer on a *different vendor* over the finished piece.
-5. `fleet say` the findings back to the builder, which keeps its context and cache, and repeat until the review is clean. Five rounds on one piece is normal.
+The whole interface is a sentence naming a model and a role:
 
-Across ~68 spawns that came out as roughly half writing workers and half read-only reviewers, and reviewers are nearly always a different vendor from the builder. The point of the whole thing is step 4: a model reviewing its own work agrees with itself.
+> use fleet to consult gpt-5.6-sol and kimi k3 at max to critique the plan
+
+> get a fleet agent to do the grunt work and get fable to review it
+
+> do all the followups now, use fleet with k3 for some of the grunt work
+
+Claude writes the brief, picks the budget, spawns the worker, arms a `fleet wait` in the background so it gets woken, reads the result, and sends review findings back with `fleet say` until the piece is clean. I see the summary.
+
+That shapes the design. The MCP tools and the CLI do the same things because the caller is an agent either way: the CLI is what it reaches for from a shell tool, and `fleet wait` blocking until a worker is final is how an agent gets a wake-up without polling. Nothing is pushed, because there is nobody watching a screen.
+
+The loop it settles into: split the work into pieces, one writing worker per piece on a strong builder, then a read-only reviewer on a *different vendor*, then findings back to the builder, repeat. Five rounds on one piece is normal. That last part is the point — a model reviewing its own work agrees with itself.
 
 ## Requirements
 
