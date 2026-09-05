@@ -98,7 +98,7 @@ func startServe(t *testing.T, d *Daemon) (stop func()) {
 	go func() { done <- d.Serve(ctx) }()
 
 	client := NewClient(d.home)
-	waitFor(t, 5*time.Second, func() bool { return client.ping(ctx) == nil }, "daemon socket to answer")
+	waitFor(t, waitTimeout, func() bool { return client.ping(ctx) == nil }, "daemon socket to answer")
 
 	var once sync.Once
 
@@ -118,6 +118,11 @@ func spawnFake(t *testing.T, d *Daemon, brief string, writes bool) string {
 
 	return id
 }
+
+// waitTimeout bounds the condition waits. It is generous because a loaded CI
+// runner under -race is several times slower than a developer machine, and the
+// waits only bound how long a genuine failure takes to report.
+const waitTimeout = 30 * time.Second
 
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string) {
 	t.Helper()
@@ -207,7 +212,7 @@ func TestDaemonRestartResumesTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitFor(t, 15*time.Second, func() bool { return strings.Contains(wk1.Result(), "beta") }, "first chunks")
+	waitFor(t, waitTimeout, func() bool { return strings.Contains(wk1.Result(), "beta") }, "first chunks")
 
 	ackBefore := wk1.Meta().AckSeq
 	if ackBefore == 0 {
@@ -351,7 +356,7 @@ func TestPermissionRejected(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		waitFor(t, 10*time.Second, func() bool { return wk1.Meta().ContextUsed > 0 }, "usage update before the restart")
+		waitFor(t, waitTimeout, func() bool { return wk1.Meta().ContextUsed > 0 }, "usage update before the restart")
 
 		stop1()
 		d1 = nil
@@ -359,7 +364,7 @@ func TestPermissionRejected(t *testing.T) {
 		// The permission request must reach the host's journal while no
 		// daemon is connected, so the next daemon replays it.
 		journal := filepath.Join(Root(home), "workers", id, "acp.jsonl")
-		waitFor(t, 10*time.Second, func() bool {
+		waitFor(t, waitTimeout, func() bool {
 			b, err := os.ReadFile(journal)
 
 			return err == nil && strings.Contains(string(b), "request_permission")
