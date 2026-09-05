@@ -122,9 +122,11 @@ func ServeHost(ctx context.Context, workerdir string) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			// Accept only fails here once shutdown has closed the listener, so
+			// the error describes the close, not a fault worth reporting.
 			<-h.shutdownCh
 
-			return nil
+			return nil //nolint:nilerr // a closed listener is a clean stop
 		}
 
 		h.handleConn(conn)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 )
 
@@ -16,8 +17,31 @@ type Agent struct {
 	Bare bool `json:"bare,omitempty"`
 }
 
+// ompPath resolves the omp binary: PATH first, then the paths the common
+// installers use. The bare name is the fallback so the failure surfaces as a
+// launch error naming the binary rather than a missing absolute path.
+func ompPath(home string) string {
+	if p, err := exec.LookPath("omp"); err == nil {
+		return p
+	}
+
+	for _, p := range []string{
+		filepath.Join(home, ".bun", "bin", "omp"),
+		filepath.Join(home, ".local", "bin", "omp"),
+		filepath.Join(home, ".npm-global", "bin", "omp"),
+		"/usr/local/bin/omp",
+		"/opt/homebrew/bin/omp",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+
+	return "omp"
+}
+
 func defaultAgents(home string) map[string]Agent {
-	omp := filepath.Join(home, ".bun", "bin", "omp")
+	omp := ompPath(home)
 	runs := Root(home)
 
 	return map[string]Agent{

@@ -20,6 +20,13 @@ import (
 	"github.com/samcm/fleet/internal/mcpserver"
 )
 
+// Set by the release build via -ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	if err := root().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "fleet:", err)
@@ -51,7 +58,16 @@ func root() *cobra.Command {
 
 	cmd.AddCommand(&cobra.Command{
 		Use: "mcp", Short: "serve MCP over stdio (for Claude Code)",
-		RunE: func(cmd *cobra.Command, _ []string) error { return mcpserver.Run(ctx, home) },
+		RunE: func(cmd *cobra.Command, _ []string) error { return mcpserver.Run(ctx, home, version) },
+	})
+
+	cmd.AddCommand(&cobra.Command{
+		Use: "version", Short: "print the build version",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "fleet %s (%s, built %s)\n", version, commit, date)
+
+			return err
+		},
 	})
 
 	cmd.AddCommand(&cobra.Command{

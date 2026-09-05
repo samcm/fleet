@@ -54,17 +54,19 @@ type waitInput struct {
 }
 
 // Run serves MCP over stdio until the client disconnects.
-func Run(ctx context.Context, home string) error {
+func Run(ctx context.Context, home, version string) error {
 	client := fleet.NewClient(home)
 	if err := client.Ensure(ctx); err != nil {
 		return err
 	}
 
-	server := mcp.NewServer(&mcp.Implementation{Name: "fleet", Version: "0.1.0"}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: "fleet", Version: version}, nil)
 
 	text := func(s string, err error) (*mcp.CallToolResult, any, error) {
 		if err != nil {
-			return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}}}, nil, nil
+			// A failed tool call is reported to the caller in the result, not as
+			// a protocol error, which would drop the message.
+			return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}}}, nil, nil //nolint:nilerr // tool errors travel in the result
 		}
 
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: s}}}, nil, nil
