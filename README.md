@@ -4,7 +4,23 @@ Headless coding-agent workers over the [Agent Client Protocol](https://agentclie
 
 One worker is one agent process on the model you name, held by a daemon that outlives the session that spawned it. State comes from the ACP event stream, not from parsing transcripts, so `fleet ls` shows what a worker is doing now. Nothing is pushed to you; you ask.
 
-It exists to run work on models other than the one you are talking to. Claude Code's built-in subagents all run on your Anthropic account.
+## Why
+
+Claude Code's built-in subagents all run on your Anthropic account, so "get a second opinion from another vendor" is not something it can do. Its subagents also die with the session that spawned them, which rules out an hour-long build.
+
+fleet gives one Claude Code session a set of long-lived workers on whatever models the agent binary can reach, and a way to check on them without sitting there.
+
+## How I use it
+
+Almost always the same loop, from the CLI rather than the MCP tools:
+
+1. Split a PRD into numbered pieces. Two vendors critique the PRD first if it is load-bearing.
+2. One writing worker per piece, on a strong builder at `xhigh` or `max`, with a 90 to 120 minute budget.
+3. `fleet wait` in the background as the wake-up, then `fleet ls` when I want to know.
+4. A read-only reviewer on a *different vendor* over the finished piece.
+5. `fleet say` the findings back to the builder, which keeps its context and cache, and repeat until the review is clean. Five rounds on one piece is normal.
+
+Across ~68 spawns that came out as roughly half writing workers and half read-only reviewers, and reviewers are nearly always a different vendor from the builder. The point of the whole thing is step 4: a model reviewing its own work agrees with itself.
 
 ## Requirements
 
