@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -20,12 +21,25 @@ import (
 	"github.com/samcm/fleet/internal/mcpserver"
 )
 
-// Set by the release build via -ldflags.
+// Set by the release build via -ldflags. A `go install` build sets none of
+// them, so buildVersion falls back to the module version the toolchain records.
 var (
 	version = "dev"
 	commit  = "none"
 	date    = "unknown"
 )
+
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+
+	return version
+}
 
 func main() {
 	if err := root().Execute(); err != nil {
@@ -58,13 +72,13 @@ func root() *cobra.Command {
 
 	cmd.AddCommand(&cobra.Command{
 		Use: "mcp", Short: "serve MCP over stdio (for Claude Code)",
-		RunE: func(cmd *cobra.Command, _ []string) error { return mcpserver.Run(ctx, home, version) },
+		RunE: func(cmd *cobra.Command, _ []string) error { return mcpserver.Run(ctx, home, buildVersion()) },
 	})
 
 	cmd.AddCommand(&cobra.Command{
 		Use: "version", Short: "print the build version",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			_, err := fmt.Fprintf(cmd.OutOrStdout(), "fleet %s (%s, built %s)\n", version, commit, date)
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "fleet %s (%s, built %s)\n", buildVersion(), commit, date)
 
 			return err
 		},
