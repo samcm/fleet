@@ -2,11 +2,12 @@
 // fleet worker uses, so integration tests can run a real agent process
 // without omp or a model provider. It understands initialize, session/new,
 // session/set_config_option, session/cancel and session/prompt; a prompt
-// emits message chunks and one usage_update, asks one edit permission
-// mid-turn, sleeps for a duration named in the prompt text, and answers with
-// end_turn and a usage object. detach=1 in the prompt starts a child in its
-// own session and names its pid, standing in for the tool processes omp
-// starts detached.
+// emits message chunks and one usage_update, makes tools=N read tool calls
+// that complete at once (the last stays open with hang=1), asks one edit
+// permission mid-turn, sleeps for a duration named in the prompt text, and
+// answers with end_turn and a usage object. detach=1 in the prompt starts a
+// child in its own session and names its pid, standing in for the tool
+// processes omp starts detached.
 package main
 
 import (
@@ -15,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -150,6 +152,12 @@ func runPrompt(id json.RawMessage, params json.RawMessage) {
 		chunk("tag=" + tag + " ")
 	}
 
+	if field(text, "accountpool=") != "" {
+		path, present := os.LookupEnv("OMP_AUTH_BROKER_ACCOUNT_POOL_FILE")
+		chunk(fmt.Sprintf("accountpool=%s accountpool-present=%t ", path, present))
+		chunk(fmt.Sprintf("home=%s agentdir=%s ", os.Getenv("HOME"), os.Getenv("PI_CODING_AGENT_DIR")))
+	}
+
 	if field(text, "detach=") != "" {
 		child := exec.Command("sleep", "300")
 		child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -165,6 +173,28 @@ func runPrompt(id json.RawMessage, params json.RawMessage) {
 		"size":          1048576,
 		"cost":          map[string]any{"amount": 7.0859, "currency": "USD"},
 	}})
+
+	// tools=N makes N read calls; with hang=1 the last never completes, like
+	// a long-running command.
+	if n, err := strconv.Atoi(field(text, "tools=")); err == nil {
+		hang := field(text, "hang=") != ""
+
+		for i := range n {
+			callID := fmt.Sprintf("read%d", i)
+			notify("session/update", map[string]any{"sessionId": "s1", "update": map[string]any{
+				"sessionUpdate": "tool_call", "toolCallId": callID, "title": "read file " + strconv.Itoa(i), "kind": "read",
+				"rawInput": map[string]string{"path": fmt.Sprintf("file%d.go", i)},
+			}})
+
+			if hang && i == n-1 {
+				break
+			}
+
+			notify("session/update", map[string]any{"sessionId": "s1", "update": map[string]any{
+				"sessionUpdate": "tool_call_update", "toolCallId": callID, "status": "completed",
+			}})
+		}
+	}
 
 	time.Sleep(permDelay)
 

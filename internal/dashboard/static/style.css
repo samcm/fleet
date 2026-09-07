@@ -1,0 +1,573 @@
+/* fleet dashboard — a fixed 1920x1080 board scaled to the display.
+   Values that come from data (widths, brand colours) arrive as custom
+   properties set by app.js; everything else lives here. */
+
+:root {
+  --bg: oklch(0.12 0.004 260);
+  --text: oklch(0.9 0.004 260);
+  --bright: oklch(0.96 0.004 260);
+  --muted: oklch(0.6 0.004 260);
+  --label: oklch(0.55 0.004 260);
+  --faint: oklch(0.5 0.004 260);
+  --rule: oklch(0.28 0.004 260);
+  --edge: oklch(0.25 0.004 260);
+  --accent: oklch(0.82 0.09 235);
+  --amber: oklch(0.84 0.13 80);
+  --red: oklch(0.72 0.15 30);
+  --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --sans: "Geist", system-ui, sans-serif;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+a { color: var(--accent); }
+a:hover { color: oklch(0.9 0.09 235); }
+
+.viewport {
+  width: 100vw;
+  height: 100vh;
+  background: var(--bg);
+  overflow: hidden;
+  position: relative;
+}
+
+.canvas {
+  width: 1920px;
+  height: 1080px;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%) scale(var(--scale, 1));
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 20px;
+  padding: 28px 32px;
+  box-sizing: border-box;
+}
+
+/* ---------- header ---------- */
+
+.head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 14px;
+}
+
+.head-left {
+  display: flex;
+  align-items: baseline;
+  gap: 18px;
+}
+
+.wordmark {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 34px;
+  letter-spacing: 0.16em;
+  color: var(--bright);
+}
+
+.uptime {
+  font-size: 17px;
+  color: var(--muted);
+}
+
+/* Shown while the daemon does not answer; the board keeps the last good data. */
+.uptime.offline { color: var(--red); }
+
+.head-right {
+  display: flex;
+  gap: 40px;
+  align-items: baseline;
+  font-size: 17px;
+  color: oklch(0.62 0.004 260);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat {
+  font-size: 28px;
+  font-weight: 600;
+}
+
+.stat-running { color: var(--accent); }
+.stat-flagged { color: var(--muted); }
+.stat-flagged.raised { color: var(--amber); }
+.stat-spent { color: var(--text); }
+
+.clock {
+  font-size: 34px;
+  color: var(--bright);
+}
+
+/* ---------- lanes ---------- */
+
+.lanes {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  min-height: 0;
+}
+
+.colhead,
+.row {
+  display: grid;
+  grid-template-columns: 48px 380px 230px minmax(0, 1fr) 270px;
+  gap: 18px;
+  padding: 0 16px;
+}
+
+.colhead {
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  color: var(--label);
+}
+
+.colhead-nums {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  text-align: right;
+}
+
+.rows {
+  display: grid;
+  grid-auto-rows: var(--row-h, 62px);
+  align-content: start;
+  gap: var(--row-gap, 10px);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.rows.is-empty {
+  display: grid;
+  place-content: center;
+}
+
+.empty {
+  font-size: 17px;
+  color: var(--muted);
+}
+
+.row {
+  align-items: center;
+  background: oklch(0.16 0.004 260);
+  border: 1px solid var(--edge);
+  border-left: 5px solid var(--state);
+  border-radius: 4px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.overflow {
+  font-size: 15px;
+  color: var(--muted);
+  padding: 0 16px;
+}
+
+/* A worker that finished cleanly stays listed for a while, faded. */
+.row.is-done { opacity: 0.5; }
+
+/* ---------- row: provider tile ---------- */
+
+.tile {
+  position: relative;
+  width: 48px;
+  height: var(--logo-h, 48px);
+  border-radius: 6px;
+  background: var(--tile-bg);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  color: var(--tile-fg);
+}
+
+.mark {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  color: var(--tile-fg);
+}
+
+.mark svg {
+  width: 60%;
+  height: 60%;
+  display: block;
+}
+
+/* ---------- row: worker and model cells ---------- */
+
+.cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.label-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.label {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: var(--label-size, 16px);
+  color: var(--bright);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.badge {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  padding: 2px 8px;
+  border-radius: 3px;
+  color: var(--bg);
+  background: var(--badge);
+  flex-shrink: 0;
+}
+
+/* Tight rows fold the meta line into the label line. */
+.meta-inline {
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 1;
+  min-width: 0;
+}
+
+.meta {
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.worker-id { color: var(--accent); }
+
+.model-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.model-name {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: var(--model-size, 16px);
+  color: var(--brand);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.think {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  padding: 2px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--think);
+  color: var(--think);
+  flex-shrink: 0;
+  line-height: 1.3;
+}
+
+.provider-name {
+  font-size: 12px;
+  color: var(--brand);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- row: activity ---------- */
+
+.act {
+  display: grid;
+  grid-template-rows: auto auto;
+  gap: 7px;
+  min-width: 0;
+}
+
+.act-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--act-size, 15px);
+  color: oklch(0.88 0.004 260);
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.act-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.act-text.is-final { color: oklch(0.72 0.004 260); }
+.act-text.is-quiet { color: var(--muted); }
+
+/* The agent's own latest sentence, quoted as it thinks or writes. */
+.act-said {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  color: oklch(0.8 0.004 260);
+  font-style: italic;
+}
+
+.act-target {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+}
+
+.project { color: oklch(0.78 0.004 260); }
+
+.tool {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--tool);
+}
+
+.act-since {
+  flex-shrink: 0;
+  font-size: 13px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Elapsed against the turn budget: a hairline, read only when needed. */
+.act-meter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.meter {
+  position: relative;
+  flex: 1;
+  height: 3px;
+  background: oklch(0.24 0.004 260);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.meter-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: var(--elapsed-x, 0%);
+  background: var(--fill);
+  transition: width 1s linear;
+}
+
+.act-time {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- row: numbers ---------- */
+
+.row-nums {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: var(--num-size, 17px);
+  color: var(--text);
+}
+
+.ctx {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  align-items: flex-end;
+}
+
+.ctx-value { color: var(--ctx); }
+
+.ctx-bar {
+  height: 4px;
+  width: 100%;
+  background: oklch(0.23 0.004 260);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.ctx-bar-fill {
+  height: 100%;
+  width: var(--ctx-x, 0%);
+  background: var(--ctx);
+}
+
+/* ---------- charts ---------- */
+
+.charts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  height: 200px;
+}
+
+.card {
+  background: oklch(0.15 0.004 260);
+  border: 1px solid var(--edge);
+  border-radius: 4px;
+  padding: 14px 16px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  min-width: 0;
+}
+
+.card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.card-title {
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  color: var(--label);
+}
+
+.card-value {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.card-value-accent { color: var(--accent); }
+
+.plot {
+  position: relative;
+  border-bottom: 1px solid var(--rule);
+  min-height: 0;
+}
+
+.plot svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.area-accent { fill: oklch(0.23 0.09 235); }
+.line-accent { stroke: var(--accent); }
+.area-neutral { fill: oklch(0.22 0.004 260); }
+.line-neutral { stroke: oklch(0.85 0.004 260); }
+
+.marks {
+  position: absolute;
+  inset: 0;
+}
+
+.flag-mark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  left: var(--x, 0%);
+  background: var(--mark);
+  opacity: 0.7;
+}
+
+.bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  border-bottom: 1px solid var(--rule);
+  min-height: 0;
+}
+
+.bar {
+  flex: 1;
+  height: var(--h, 0%);
+  display: flex;
+  flex-direction: column-reverse;
+  min-height: 2px;
+}
+
+.seg {
+  height: var(--h, 0%);
+  background: var(--seg);
+}
+
+.legend-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px 14px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.swatch {
+  width: 8px;
+  height: 8px;
+  background: var(--seg);
+  border-radius: 1px;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.legend-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.legend-value {
+  margin-left: auto;
+  color: oklch(0.85 0.004 260);
+  font-variant-numeric: tabular-nums;
+}
+
+.card-foot {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--faint);
+}

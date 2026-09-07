@@ -66,31 +66,41 @@ fleet result w-4e94b3
 
 Without `--writes` the agent runs with `--approval-mode always-ask` and fleet refuses every edit, delete and move, so the worker cannot touch the tree. It cannot run tests either.
 
-`--model` takes a full `provider/model` selector; `omp models` lists them. `--thinking` takes an effort level that model supports, which varies — `omp models --json` has the ladder per model.
+`--model` takes a full `provider/model` selector and a bare model name is refused at spawn; `fleet models` lists the roster and `omp models` the whole catalog. `--thinking` takes an effort level that model supports, which varies — `omp models --json` has the ladder per model.
+
+`--account` pins the worker to one named OAuth account from `~/.fleet/accounts.yaml`, read again on every spawn: `accounts` maps a name to `{provider, identity}`, where `identity` is omp's OAuth identity key in the form `email:<x>|org:<y>`, and `defaults` maps a provider to the account a spawn that names none gets — no default for that provider means no pin. The provider is the part of `--model` before the slash. `--account balanced` turns the pin off and leaves omp's own balancing in charge.
+
+The identity never reaches the worker's argv or environment: fleet writes it into a pool file in the worker directory and points omp at that file with `OMP_AUTH_BROKER_ACCOUNT_POOL_FILE`, so the process sees only that one account for that provider.
 
 ## Commands
 
 ```sh
-fleet spawn [flags]     # --model --thinking --cwd --label --brief --writes --minutes --agent
+fleet spawn [flags]     # --model --thinking --account --cwd --label --brief --writes --minutes --agent
 fleet ls [--all]        # state, elapsed/budget, model, label, current activity, tokens, context fill, cost
+fleet models [--all]    # the roster joined with the live omp catalog: tier, thinking, ladder, price, speed, context
 fleet result <id>       # --turn N for an earlier turn, --turn all for every turn
 fleet say <id> "<msg>"  # follow-up on the live session; keeps its context and cache
 fleet stop <id>
 fleet log <id> [--tail N]
 fleet wait <id> [--timeout 1800]       # blocks until final, exit 3 on timeout
 fleet watch [ids...] [--timeout 3600]  # a line per state change or flag
+fleet dashboard [--addr 127.0.0.1:7770] # the status wall, for a browser
 fleet version
 ```
 
-`--minutes` is the per-turn budget, default 25 (10 for `oracle`). `--agent` defaults to `omp`.
+`--minutes` is the per-turn budget, default 25 (10 for `oracle`); fleet cuts the turn there and the worker is never told the clock. `--agent` defaults to `omp`.
+
+`~/.fleet/roster.yaml` is the model roster: `models` maps a full selector to `{thinking, tier, tps, note}`; `thinking` is one level or a list of allowed levels, first the default, and `fleet spawn` refuses a level outside it. `fleet models` and the `fleet_models` MCP tool print it against the live catalog (ladder, price, context), so the operator's view of the models lives in one file and the catalog facts come from omp.
 
 To be woken, run `fleet wait` as a background command, or `fleet watch` for several. Both take a timeout.
+
+`fleet dashboard` serves a 1920×1080 status wall for a screen: one lane per worker `ls` would show, with the provider mark, the repository its tree belongs to (a worktree is named after its main checkout), model and thinking level, what it is doing now (the tool call in flight, else the last sentence it wrote, else the first line of its reply once it is done), a hairline of elapsed against the turn budget, context fill, tokens and cost; under it, a day of concurrency, tokens and spend by model, and an hour of tool calls per minute. It is read-only, polls the daemon every three seconds, and listens on loopback unless `--addr` says otherwise. The agent reports tokens and cost over ACP only when a turn ends, so during a turn the daemon reads them from the session journal omp writes (`sessions/<tree>/<time>_<session id>.jsonl` under the agent directory), every two seconds; context fill still arrives at turn end.
 
 ## States
 
 Final: `DONE`, `TIMEOUT`, `STOPPED`, `FAILED`, `QUOTA`. `DONE` means the worker stopped, not that the work is right.
 
-Flags on a running worker: `NO-TURN` (no event for 180s), `STALLED` (900s silent with no tool call in flight), `LOOPING` (same tool title in four of the last six calls).
+Flags on a running worker: `NO-TURN` (no event for 180s), `STALLED` (900s silent with no tool call in flight), `LOOPING` (same tool title in four of the last six calls), `NO-TOOLS` (ten minutes into a turn with no tool call at all; the seat is reasoning about files it never opened). A turn whose whole reply is a provider quota error ends `QUOTA`, not `DONE`.
 
 `FAILED` or `QUOTA` in the first status line is the launch dying — unknown model, unsupported effort, auth, or a provider limit. Fix the spec rather than retrying it unchanged. After launch, `fleet log <id>` and `~/.fleet/workers/<id>/stderr.log` have the detail. `TIMEOUT` keeps its result and its context, so `fleet say "continue"` is usually better than respawning. A worker that sits `DONE` or `TIMEOUT` for an hour with no follow-up is released: its agent process ends, its files and its `fleet ls --all` entry stay, and `fleet say` then asks for a new worker.
 

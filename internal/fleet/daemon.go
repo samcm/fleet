@@ -33,6 +33,8 @@ type Daemon struct {
 	logger   *slog.Logger
 	agents   map[string]Agent
 	hostArgv []string
+	started  time.Time
+	calls    *callLog
 
 	mu      sync.Mutex
 	workers map[string]*Worker
@@ -57,13 +59,19 @@ func NewDaemon(home string, logger *slog.Logger) (*Daemon, error) {
 		logger:   logger.WithGroup("fleet"),
 		agents:   agents,
 		hostArgv: []string{self, "host"},
+		started:  time.Now(),
+		calls:    &callLog{},
 		workers:  make(map[string]*Worker),
 		history:  make(map[string]Meta),
 	}
 
+	cutoff := d.started.Add(-hourWindow)
+
 	entries, _ := os.ReadDir(filepath.Join(Root(home), "workers"))
 	for _, e := range entries {
-		b, err := os.ReadFile(filepath.Join(Root(home), "workers", e.Name(), "meta.json"))
+		dir := filepath.Join(Root(home), "workers", e.Name())
+
+		b, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 		if err != nil {
 			continue
 		}
@@ -80,7 +88,13 @@ func NewDaemon(home string, logger *slog.Logger) (*Daemon, error) {
 		default:
 			d.history[m.ID] = m
 		}
+
+		if m.Ended.IsZero() || m.Ended.After(cutoff) {
+			d.calls.recall(dir, cutoff)
+		}
 	}
+
+	d.calls.sort()
 
 	return d, nil
 }
@@ -124,7 +138,7 @@ func (d *Daemon) resume(m Meta) {
 			return
 		}
 
-		wk, err := newWorker(dir, m, agent, d.home, d.hostArgv, d.logger)
+		wk, err := newWorker(dir, m, agent, d.home, d.hostArgv, d.calls, d.logger)
 		if err != nil {
 			client.Close()
 			d.failResume(dir, m, err.Error())
@@ -185,6 +199,7 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	mux.HandleFunc("GET /log", d.handleLog)
 	mux.HandleFunc("GET /workers", d.handleWorkers)
 	mux.HandleFunc("GET /wait", d.handleWait)
+	mux.HandleFunc("GET /dashboard", d.handleDashboard)
 	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -201,6 +216,7 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	d.logger.Info("fleet daemon listening", slog.String("socket", sock))
 
 	go d.releaseIdle(ctx)
+	go d.refreshUsage(ctx)
 
 	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -242,17 +258,44 @@ func (d *Daemon) releaseIdle(ctx context.Context) {
 	}
 }
 
-// releaseIdleAt is one pass of releaseIdle, judging idleness against now.
-func (d *Daemon) releaseIdleAt(now time.Time) {
-	d.mu.Lock()
-	workers := make([]*Worker, 0, len(d.workers))
+// refreshEvery is how often the daemon reads the running workers' session
+// journals for cost and tokens the agent has not yet reported.
+const refreshEvery = 2 * time.Second
 
+// refreshUsage keeps every running worker's cost and tokens current from
+// its session journal until ctx ends.
+func (d *Daemon) refreshUsage(ctx context.Context) {
+	ticker := time.NewTicker(refreshEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			for _, wk := range d.liveWorkers() {
+				wk.refreshUsage(now)
+			}
+		}
+	}
+}
+
+// liveWorkers snapshots the workers the daemon holds.
+func (d *Daemon) liveWorkers() []*Worker {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	workers := make([]*Worker, 0, len(d.workers))
 	for _, wk := range d.workers {
 		workers = append(workers, wk)
 	}
-	d.mu.Unlock()
 
-	for _, wk := range workers {
+	return workers
+}
+
+// releaseIdleAt is one pass of releaseIdle, judging idleness against now.
+func (d *Daemon) releaseIdleAt(now time.Time) {
+	for _, wk := range d.liveWorkers() {
 		if wk.releaseIdle(now) {
 			d.logger.Info("released idle worker", slog.String("worker", wk.Meta().ID))
 		}
@@ -297,6 +340,9 @@ func (d *Daemon) Spawn(ctx context.Context, spec Spec) (string, error) {
 	switch {
 	case spec.Model == "":
 		return "", errors.New("model is required (full provider/model id)")
+	case !strings.Contains(spec.Model, "/"):
+		return "", fmt.Errorf("model %q is not a provider/model id; omp needs the provider prefix, e.g. anthropic/claude-opus-5", spec.Model)
+
 	case spec.Thinking == "":
 		return "", errors.New("thinking is required")
 	case strings.TrimSpace(spec.Brief) == "":
@@ -315,6 +361,27 @@ func (d *Daemon) Spawn(ctx context.Context, spec Spec) (string, error) {
 		}
 	}
 
+	roster, err := LoadRoster(d.home)
+	if err != nil {
+		return "", err
+	}
+
+	if allowed, ok := roster.Allows(spec.Model, spec.Thinking); !ok {
+		return "", fmt.Errorf("thinking %q is not allowed for %s in %s (allowed: %s)", spec.Thinking, spec.Model, RosterPath(d.home), allowed)
+	}
+
+	accounts, err := loadAccounts(d.home)
+	if err != nil {
+		return "", err
+	}
+
+	account, identity, err := accounts.resolve(spec.Account, spec.Model, accountsPath(d.home))
+	if err != nil {
+		return "", err
+	}
+
+	spec.Account = account
+
 	if spec.Minutes <= 0 {
 		spec.Minutes = 25
 		if agent.Bare {
@@ -323,9 +390,9 @@ func (d *Daemon) Spawn(ctx context.Context, spec Spec) (string, error) {
 	}
 
 	id := newID()
-	meta := Meta{ID: id, Spec: spec, Started: time.Now(), State: StateStarting}
+	meta := Meta{ID: id, Spec: spec, AccountIdentity: identity, Started: time.Now(), State: StateStarting}
 
-	wk, err := newWorker(filepath.Join(Root(d.home), "workers", id), meta, agent, d.home, d.hostArgv, d.logger)
+	wk, err := newWorker(filepath.Join(Root(d.home), "workers", id), meta, agent, d.home, d.hostArgv, d.calls, d.logger)
 	if err != nil {
 		return "", err
 	}
@@ -426,7 +493,7 @@ func (d *Daemon) Ls(all bool, only string) string {
 		return "no workers\n"
 	}
 
-	_, _ = fmt.Fprintf(&b, "%-8s %-9s %-9s %-7s %-26s %-6s %s\n", "STATE", "ID", "ELAPSED", "AGENT", "MODEL", "THINK", "LABEL")
+	_, _ = fmt.Fprintf(&b, "%-8s %-9s %-9s %-7s %-26s %-6s %-10s %s\n", "STATE", "ID", "ELAPSED", "AGENT", "MODEL", "THINK", "ACCOUNT", "LABEL")
 
 	for _, r := range rows {
 		m := r.meta
@@ -443,7 +510,12 @@ func (d *Daemon) Ls(all bool, only string) string {
 			model = model[i+1:]
 		}
 
-		_, _ = fmt.Fprintf(&b, "%-8s %-9s %-9s %-7s %-26s %-6s %s\n", m.State, m.ID, elapsed, m.Spec.Agent, truncate(model, 26), m.Spec.Thinking, m.Spec.Label)
+		account := m.Spec.Account
+		if account == "" {
+			account = "-"
+		}
+
+		_, _ = fmt.Fprintf(&b, "%-8s %-9s %-9s %-7s %-26s %-6s %-10s %s\n", m.State, m.ID, elapsed, m.Spec.Agent, truncate(model, 26), m.Spec.Thinking, account, m.Spec.Label)
 
 		detail := r.now.Line
 		if r.now.Flag != "" {
@@ -617,14 +689,7 @@ type Status struct {
 
 // Statuses snapshots every live worker.
 func (d *Daemon) Statuses() []Status {
-	d.mu.Lock()
-	workers := make([]*Worker, 0, len(d.workers))
-
-	for _, wk := range d.workers {
-		workers = append(workers, wk)
-	}
-	d.mu.Unlock()
-
+	workers := d.liveWorkers()
 	out := make([]Status, 0, len(workers))
 
 	for _, wk := range workers {

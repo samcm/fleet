@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -17,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/samcm/fleet/internal/acp"
+	"github.com/samcm/fleet/internal/dashboard"
 	"github.com/samcm/fleet/internal/fleet"
 	"github.com/samcm/fleet/internal/mcpserver"
 )
@@ -133,6 +135,7 @@ func root() *cobra.Command {
 	spawn.Flags().StringVar(&spec.Agent, "agent", "omp", "agent: omp or oracle")
 	spawn.Flags().StringVar(&spec.Model, "model", "", "full provider/model id")
 	spawn.Flags().StringVar(&spec.Thinking, "thinking", "", "thinking level")
+	spawn.Flags().StringVar(&spec.Account, "account", "", "named account from ~/.fleet/accounts.yaml whose OAuth identity the worker is pinned to; empty applies the provider default from that file; balanced turns the pin off")
 	spawn.Flags().StringVar(&spec.Cwd, "cwd", "", "absolute working directory")
 	spawn.Flags().StringVar(&spec.Label, "label", "", "one line, at most 15 words")
 	spawn.Flags().StringVar(&briefPath, "brief", "", "path to the brief file")
@@ -141,6 +144,22 @@ func root() *cobra.Command {
 	cmd.AddCommand(spawn)
 
 	var all bool
+
+	models := &cobra.Command{
+		Use: "models", Short: "the model roster against the live omp catalog",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			out, err := fleet.Models(ctx, home, all)
+			if err != nil {
+				return err
+			}
+
+			fmt.Print(out)
+
+			return nil
+		},
+	}
+	models.Flags().BoolVar(&all, "all", false, "every catalog model, not only the roster")
+	cmd.AddCommand(models)
 
 	ls := &cobra.Command{
 		Use: "ls", Short: "list workers",
@@ -203,6 +222,31 @@ func root() *cobra.Command {
 	}
 	watchCmd.Flags().IntVar(&watchTimeout, "timeout", 3600, "seconds before giving up")
 	cmd.AddCommand(watchCmd)
+
+	var dashAddr string
+
+	dashCmd := &cobra.Command{
+		Use: "dashboard", Short: "serve the status wall for a browser",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := client.Ensure(ctx); err != nil {
+				return err
+			}
+
+			ln, err := net.Listen("tcp", dashAddr)
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("fleet dashboard on http://%s\n", ln.Addr())
+
+			ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			return dashboard.Serve(ctx, ln, client)
+		},
+	}
+	dashCmd.Flags().StringVar(&dashAddr, "addr", "127.0.0.1:7770", "address to listen on")
+	cmd.AddCommand(dashCmd)
 
 	var tail int
 

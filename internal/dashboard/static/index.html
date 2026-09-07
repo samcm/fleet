@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fleet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&family=Geist:wght@500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="viewport">
+  <!-- Fixed 1920x1080 canvas; app.js scales it to whatever the display is. -->
+  <div class="canvas" id="canvas">
+
+    <div class="head">
+      <div class="head-left">
+        <span class="wordmark">FLEET</span>
+        <span class="uptime" id="uptime">daemon up &mdash;</span>
+      </div>
+      <div class="head-right">
+        <span><b class="stat stat-running" id="stat-running">0</b> running</span>
+        <span><b class="stat stat-flagged" id="stat-flagged">0</b> flagged</span>
+        <span><b class="stat stat-spent" id="stat-spent">$0.00</b> spent today</span>
+        <span class="clock" id="clock">00:00:00</span>
+      </div>
+    </div>
+
+    <div class="lanes">
+      <div class="colhead">
+        <span></span>
+        <span>WORKER</span>
+        <span>MODEL</span>
+        <span>ACTIVITY</span>
+        <div class="colhead-nums"><span>CONTEXT</span><span>TOKENS</span><span>COST</span></div>
+      </div>
+      <div class="rows" id="rows"></div>
+      <div class="overflow" id="overflow" hidden></div>
+    </div>
+
+    <div class="charts">
+
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title">CONCURRENCY &middot; 24 H</span>
+          <span class="card-value card-value-accent" id="conc-now">0</span>
+        </div>
+        <div class="plot">
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none">
+            <polygon class="area-accent" id="conc-area" points=""></polygon>
+            <polyline class="line-accent" id="conc-line" points="" fill="none" stroke-width="1.6" vector-effect="non-scaling-stroke" stroke-linejoin="round"></polyline>
+          </svg>
+        </div>
+        <div class="card-foot"><span>-24h</span><span id="conc-peak">peak 0</span><span>now</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title">TOKENS &middot; 24 H &middot; BY MODEL</span>
+          <span class="card-value" id="tok-now">0</span>
+        </div>
+        <div class="bars" id="tok-bars"></div>
+        <div class="legend-grid" id="tok-legend"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title">SPEND &middot; 24 H &middot; BY MODEL</span>
+          <span class="card-value" id="spend-now">$0.00</span>
+        </div>
+        <div class="bars" id="spend-bars"></div>
+        <div class="legend-grid" id="spend-legend"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title">TOOL CALLS / MIN</span>
+          <span class="card-value" id="calls-now">0</span>
+        </div>
+        <div class="plot">
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none">
+            <polygon class="area-neutral" id="calls-area" points=""></polygon>
+            <polyline class="line-neutral" id="calls-line" points="" fill="none" stroke-width="1.6" vector-effect="non-scaling-stroke" stroke-linejoin="round"></polyline>
+          </svg>
+          <div class="marks" id="calls-marks"></div>
+        </div>
+        <div class="card-foot"><span>-60m</span><span>marks = flag raised</span><span>now</span></div>
+      </div>
+
+    </div>
+
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

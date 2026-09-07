@@ -15,14 +15,15 @@ import (
 
 type spawnInput struct {
 	Agent     string `json:"agent,omitempty" jsonschema:"agent to run: omp (default, full coding agent with tools) or oracle (bare one-shot: no tools, no context files, the brief must carry everything)"`
-	Model     string `json:"model" jsonschema:"full provider/model id exactly as omp names it, e.g. openai-codex/gpt-5.6-terra"`
+	Model     string `json:"model" jsonschema:"full provider/model id exactly as fleet_models lists it, e.g. anthropic/claude-opus-5; a bare name is refused"`
 	Thinking  string `json:"thinking" jsonschema:"thinking level on the model's ladder: off minimal low medium high xhigh max"`
+	Account   string `json:"account,omitempty" jsonschema:"named account from ~/.fleet/accounts.yaml whose OAuth identity the worker is pinned to; empty applies the provider default from that file; balanced turns the pin off"`
 	Cwd       string `json:"cwd,omitempty" jsonschema:"absolute path of the repo or worktree the worker edits; ignored for oracle"`
 	Label     string `json:"label" jsonschema:"what this worker is for, one line, at most 15 words; shown in fleet_ls"`
 	Brief     string `json:"brief,omitempty" jsonschema:"the full brief text; or use brief_path"`
 	BriefPath string `json:"brief_path,omitempty" jsonschema:"absolute path of a file holding the brief"`
 	Writes    bool   `json:"writes,omitempty" jsonschema:"true only for a worker that edits files; otherwise edit/delete/move tool calls are refused"`
-	Minutes   int    `json:"minutes,omitempty" jsonschema:"wall-clock budget per turn in minutes (default 25, oracle 10); the worker is told its hard stop"`
+	Minutes   int    `json:"minutes,omitempty" jsonschema:"wall-clock budget per turn in minutes (default 25, oracle 10); fleet cuts the turn at the budget and the worker is never told it"`
 }
 
 type idInput struct {
@@ -41,6 +42,10 @@ type sayInput struct {
 
 type lsInput struct {
 	All bool `json:"all,omitempty" jsonschema:"include workers finished more than 30 minutes ago"`
+}
+
+type modelsInput struct {
+	All bool `json:"all,omitempty" jsonschema:"every model in the omp catalog, not only the roster"`
 }
 
 type logInput struct {
@@ -76,7 +81,7 @@ func Run(ctx context.Context, home, version string) error {
 		Name: "fleet_spawn",
 		Description: "Start one headless coding-agent worker on the given model and return its id. The worker runs on its own; " +
 			"nothing is pushed back to you. Check on it with fleet_ls, read its reply with fleet_result, steer it with fleet_say, end it with fleet_stop. " +
-			"A worker that dies at launch (bad model, quota, auth) shows FAILED or QUOTA in fleet_ls within seconds. " +
+			"A worker that dies at launch (bad model, quota, auth) shows FAILED or QUOTA in fleet_ls within seconds; a turn whose whole reply is a provider quota error also ends QUOTA. " +
 			"To be woken when it finishes, run `fleet wait <id> --timeout 5400` as a background shell command; it exits when the worker is final.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in spawnInput) (*mcp.CallToolResult, any, error) {
 		brief := in.Brief
@@ -90,17 +95,30 @@ func Run(ctx context.Context, home, version string) error {
 		}
 
 		return text(client.Spawn(ctx, fleet.Spec{
-			Agent: in.Agent, Model: in.Model, Thinking: in.Thinking, Cwd: in.Cwd, Label: in.Label,
-			Brief: brief, Writes: in.Writes, Minutes: in.Minutes,
+			Agent: in.Agent, Model: in.Model, Thinking: in.Thinking, Account: in.Account, Cwd: in.Cwd,
+			Label: in.Label, Brief: brief, Writes: in.Writes, Minutes: in.Minutes,
 		}))
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "fleet_ls",
 		Description: "One entry per worker: state, elapsed/budget, model, label, then what it is doing right now (tool in flight and for how long, " +
-			"or seconds silent, plus its last words) and token usage. A FLAG prefix means NO-TURN, STALLED or LOOPING. Cheap; call it whenever you want to know.",
+			"or seconds silent, plus its last words) and token usage. States: STARTING RUNNING DONE TIMEOUT STOPPED FAILED QUOTA. " +
+			"A FLAG prefix is the only thing to react to: NO-TURN (3 min with no event: dead provider or auth hang; stop and relaunch elsewhere), " +
+			"STALLED (15 min silent with no tool call in flight: read fleet_log, then nudge with fleet_say or stop), " +
+			"LOOPING (same tool title in 4 of the last 6 calls: stop, tighten the brief, respawn), " +
+			"NO-TOOLS (10 min into a turn with no tool call: it is reasoning about files it never opened; stop and respawn). Cheap; call it whenever you want to know.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in lsInput) (*mcp.CallToolResult, any, error) {
 		return text(client.Ls(ctx, in.All))
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "fleet_models",
+		Description: "The model roster joined live with the omp catalog: tier, the thinking levels allowed (first is the default; fleet_spawn refuses others), the ladder it supports, " +
+			"price per million tokens in and out (quota for subscription models), measured tokens per second, context size and the operator's note. " +
+			"Call it before choosing a model. The roster is ~/.fleet/roster.yaml; change it there. Pass all=true for the whole catalog.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in modelsInput) (*mcp.CallToolResult, any, error) {
+		return text(fleet.Models(ctx, home, in.All))
 	})
 
 	mcp.AddTool(server, &mcp.Tool{

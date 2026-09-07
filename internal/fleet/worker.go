@@ -1,6 +1,9 @@
 package fleet
 
 import (
+	"bufio"
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -37,6 +40,7 @@ type Spec struct {
 	Agent    string `json:"agent"`
 	Model    string `json:"model"`
 	Thinking string `json:"thinking"`
+	Account  string `json:"account"`
 	Cwd      string `json:"cwd"`
 	Label    string `json:"label"`
 	Brief    string `json:"brief"`
@@ -46,21 +50,24 @@ type Spec struct {
 
 // Meta is the persisted description of a worker.
 type Meta struct {
-	ID        string     `json:"id"`
-	Spec      Spec       `json:"spec"`
-	Started   time.Time  `json:"started"`
-	SessionID string     `json:"session_id,omitempty"`
-	PID       int        `json:"pid,omitempty"`
-	State     State      `json:"state"`
-	Detail    string     `json:"detail,omitempty"`
-	Turns     int        `json:"turns"`
-	TurnLog   []TurnInfo `json:"turn_log,omitempty"`
-	Usage     Usage      `json:"usage"`
+	ID              string     `json:"id"`
+	Spec            Spec       `json:"spec"`
+	Started         time.Time  `json:"started"`
+	SessionID       string     `json:"session_id,omitempty"`
+	PID             int        `json:"pid,omitempty"`
+	State           State      `json:"state"`
+	Detail          string     `json:"detail,omitempty"`
+	Turns           int        `json:"turns"`
+	TurnLog         []TurnInfo `json:"turn_log,omitempty"`
+	Usage           Usage      `json:"usage"`
+	AccountIdentity string     `json:"account_identity,omitempty"`
 	// ContextUsed and ContextSize are the agent's latest reported context
-	// window fill in tokens; CostUSD is the latest reported session cost.
+	// window fill in tokens; CostUSD is the latest reported session cost and
+	// CostAt when it was reported.
 	ContextUsed int64     `json:"context_used,omitempty"`
 	ContextSize int64     `json:"context_size,omitempty"`
 	CostUSD     float64   `json:"cost_usd,omitempty"`
+	CostAt      time.Time `json:"cost_at,omitzero"`
 	Ended       time.Time `json:"ended,omitempty"`
 	// Restart survival: AckSeq is the host stream position handled so far,
 	// NextRPCID keeps request ids unique across reattaches, and TurnCallID
@@ -71,11 +78,18 @@ type Meta struct {
 	TurnDeadline time.Time `json:"turn_deadline,omitempty"`
 }
 
-// TurnInfo records how one turn ended so past turns stay listable after the
-// in-memory text of earlier turns is gone.
+// TurnInfo records one finished turn: how it ended, when it ran and what it
+// consumed, so past turns stay listable and chartable after the in-memory
+// text of earlier turns is gone. CostUSD is the session's cumulative cost as
+// reported at the end of the turn, like Meta.CostUSD; the turn's own share is
+// the difference from the previous entry.
 type TurnInfo struct {
-	State State `json:"state"`
-	Chars int   `json:"chars"`
+	State   State     `json:"state"`
+	Chars   int       `json:"chars"`
+	Started time.Time `json:"started"`
+	Ended   time.Time `json:"ended"`
+	Usage   Usage     `json:"usage"`
+	CostUSD float64   `json:"cost_usd,omitempty"`
 }
 
 // Usage is cumulative token usage across turns.
@@ -85,10 +99,13 @@ type Usage struct {
 	Output     int64 `json:"output"`
 }
 
+// toolCall is one tool call the agent has made: Title is the agent's own
+// description of it and Target the file, command or pattern it named.
 type toolCall struct {
 	ID      string
 	Title   string
 	Kind    string
+	Target  string
 	Started time.Time
 }
 
@@ -99,6 +116,9 @@ type Worker struct {
 	logger   *slog.Logger
 	home     string
 	hostArgv []string
+	calls    *callLog
+	// project names the repository the worker's tree belongs to.
+	project string
 
 	mu         sync.Mutex
 	meta       Meta
@@ -107,10 +127,16 @@ type Worker struct {
 	turnStart  time.Time
 	lastEvent  time.Time
 	inFlight   map[string]toolCall
+	lastCall   toolCall
+	turnCalls  int
 	recent     []string
 	turnText   strings.Builder
 	turnFile   *os.File
 	lastText   string
+	// narration is the tail of what the agent has written this turn, its
+	// reasoning and its reply alike, so its latest sentence can be quoted.
+	narration  strings.Builder
+	live       liveUsage
 	pendingSay string
 	stderrPath string
 	events     *os.File
@@ -118,14 +144,33 @@ type Worker struct {
 	released   bool
 }
 
+// liveUsage is what the agent's own session journal shows the worker has
+// spent so far. omp reports cost and tokens over ACP only when a turn ends,
+// but appends every model reply's usage to the journal as it arrives, so the
+// journal is read behind an offset to price a running turn as it goes.
+type liveUsage struct {
+	path   string
+	offset int64
+	cost   float64
+	tokens int64
+}
+
+// narrationKeep bounds narration; once it grows past four times this, only
+// the last narrationKeep bytes are kept.
+const narrationKeep = 1024
+
 // idleAfter is how long a finished worker keeps its agent for a follow-up.
 // After that the daemon releases it: the process ends, the files and the ls
 // entry stay, and fleet say asks for a new worker.
 const idleAfter = time.Hour
 
+// noToolsAfter is how long a tool-bearing seat may run without one tool
+// call before ls flags it.
+const noToolsAfter = 10 * time.Minute
+
 var quotaPattern = regexp.MustCompile(`(?i)usage limit|out of credits|need a Grok subscription|insufficient_quota|billing|rate.?limit`)
 
-func newWorker(dir string, meta Meta, agent Agent, home string, hostArgv []string, logger *slog.Logger) (*Worker, error) {
+func newWorker(dir string, meta Meta, agent Agent, home string, hostArgv []string, calls *callLog, logger *slog.Logger) (*Worker, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -141,10 +186,15 @@ func newWorker(dir string, meta Meta, agent Agent, home string, hostArgv []strin
 		logger:     logger.With(slog.String("worker", meta.ID)),
 		home:       home,
 		hostArgv:   hostArgv,
+		calls:      calls,
 		meta:       meta,
 		inFlight:   make(map[string]toolCall),
 		stderrPath: filepath.Join(dir, "stderr.log"),
 		events:     events,
+	}
+
+	if !agent.Bare {
+		w.project = projectOf(meta.Spec.Cwd)
 	}
 
 	if err := os.WriteFile(filepath.Join(dir, "brief.md"), []byte(meta.Spec.Brief), 0o644); err != nil {
@@ -213,9 +263,29 @@ func (w *Worker) start(ctx context.Context) error {
 		argv = append(argv, "--approval-mode", mode)
 	}
 
+	env := append([]string(nil), w.agent.Env...)
+	if w.meta.Spec.Account != "" {
+		provider, _, _ := strings.Cut(w.meta.Spec.Model, "/")
+		pool, err := json.Marshal(map[string][]string{provider: {w.meta.AccountIdentity}})
+		if err != nil {
+			return w.fail(StateFailed, "encode account pool: "+err.Error())
+		}
+
+		path, err := filepath.Abs(filepath.Join(w.dir, "accounts.json"))
+		if err != nil {
+			return w.fail(StateFailed, "resolve account pool path: "+err.Error())
+		}
+
+		if err := os.WriteFile(path, pool, 0o600); err != nil {
+			return w.fail(StateFailed, "write account pool: "+err.Error())
+		}
+
+		env = append(env, "OMP_AUTH_BROKER_ACCOUNT_POOL_FILE="+path)
+	}
+
 	hostArgv := append(append([]string(nil), w.hostArgv...), w.dir)
 
-	client, err := acp.Launch(hostArgv, w.dir, acp.LaunchSpec{Argv: argv, Env: w.agent.Env, Cwd: cwd, StderrPath: w.stderrPath})
+	client, err := acp.Launch(hostArgv, w.dir, acp.LaunchSpec{Argv: argv, Env: env, Cwd: cwd, StderrPath: w.stderrPath})
 	if err != nil {
 		return w.fail(StateFailed, err.Error())
 	}
@@ -291,7 +361,10 @@ func (w *Worker) prompt(text string) {
 	w.turnStart = time.Now()
 	w.lastEvent = time.Time{}
 	w.turnText.Reset()
+	w.narration.Reset()
 	w.inFlight = make(map[string]toolCall)
+	w.lastCall = toolCall{}
+	w.turnCalls = 0
 	w.recent = nil
 	w.meta.State = StateRunning
 	w.meta.Detail = ""
@@ -314,10 +387,6 @@ func (w *Worker) prompt(text string) {
 		w.mu.Lock()
 		w.turnFile = turnFile
 		w.mu.Unlock()
-	}
-
-	if !w.agent.Bare {
-		text += deadlineNote(w.meta.Spec.Minutes)
 	}
 
 	go w.runTurn(turnCtx, cancel, callID, sessionID, text)
@@ -377,10 +446,15 @@ func (w *Worker) finishTurn(callID, ackSeq int64, err error, res *promptResult, 
 		return
 	}
 
+	began := w.turnBegan()
+
+	var turnUsage Usage
+
 	if res.Usage != nil {
-		w.meta.Usage.Input += res.Usage.InputTokens
-		w.meta.Usage.Output += res.Usage.OutputTokens
-		w.meta.Usage.CachedRead += res.Usage.CachedReadTokens
+		turnUsage = Usage{Input: res.Usage.InputTokens, CachedRead: res.Usage.CachedReadTokens, Output: res.Usage.OutputTokens}
+		w.meta.Usage.Input += turnUsage.Input
+		w.meta.Usage.Output += turnUsage.Output
+		w.meta.Usage.CachedRead += turnUsage.CachedRead
 	}
 
 	switch {
@@ -399,8 +473,7 @@ func (w *Worker) finishTurn(callID, ackSeq int64, err error, res *promptResult, 
 		w.meta.State = StateFailed
 		w.meta.Detail = err.Error()
 	default:
-		w.meta.State = StateDone
-		w.meta.Detail = "stopReason " + res.StopReason
+		w.meta.State, w.meta.Detail = replyState(w.turnText.String(), res.StopReason)
 	}
 
 	if ackSeq > w.meta.AckSeq {
@@ -419,7 +492,10 @@ func (w *Worker) finishTurn(callID, ackSeq int64, err error, res *promptResult, 
 		_ = os.WriteFile(filepath.Join(w.dir, fmt.Sprintf("result%d.md", w.meta.Turns)), []byte(w.turnText.String()), 0o644)
 	}
 
-	w.meta.TurnLog = append(w.meta.TurnLog, TurnInfo{State: w.meta.State, Chars: w.turnText.Len()})
+	w.meta.TurnLog = append(w.meta.TurnLog, TurnInfo{
+		State: w.meta.State, Chars: w.turnText.Len(),
+		Started: began, Ended: w.meta.Ended, Usage: turnUsage, CostUSD: w.meta.CostUSD,
+	})
 	w.saveMeta()
 
 	if w.pendingSay != "" && w.meta.State == StateDone {
@@ -430,17 +506,27 @@ func (w *Worker) finishTurn(callID, ackSeq int64, err error, res *promptResult, 
 	}
 }
 
-func deadlineNote(minutes int) string {
-	reserve := 3
-	if minutes < 15 {
-		reserve = max(minutes/5, 1)
+// replyState classifies a finished turn. Providers report an exhausted
+// subscription as a normal end_turn whose whole reply is the error line, so
+// a short reply matching the quota pattern is QUOTA rather than DONE.
+func replyState(reply, stopReason string) (State, string) {
+	reply = strings.TrimSpace(reply)
+	if len(reply) < 300 && quotaPattern.MatchString(reply) {
+		return StateQuota, reply
 	}
 
-	stop := time.Now().UTC().Add(time.Duration(minutes) * time.Minute)
-	report := stop.Add(-time.Duration(reserve) * time.Minute)
+	return StateDone, "stopReason " + stopReason
+}
 
-	return fmt.Sprintf("\n---\nfleet: wall-clock budget %d minutes, hard stop at %s UTC. Be in a committed, reported state by %s UTC; check `date -u` if unsure. Anything still unreported at the hard stop is lost.\n",
-		minutes, stop.Format("15:04"), report.Format("15:04"))
+// turnBegan is when the current turn was prompted. turnStart is reset on a
+// daemon reattach so the resumed turn gets a fresh silence grace period, but
+// the persisted deadline still fixes the original prompt time; must hold mu.
+func (w *Worker) turnBegan() time.Time {
+	if !w.meta.TurnDeadline.IsZero() {
+		return w.meta.TurnDeadline.Add(-time.Duration(w.meta.Spec.Minutes) * time.Minute)
+	}
+
+	return w.turnStart
 }
 
 func (w *Worker) eventLoop() {
@@ -498,19 +584,23 @@ func (w *Worker) attach(client *acp.Client) {
 	deadline := w.meta.TurnDeadline
 	sessionID := w.meta.SessionID
 
-	if callID != 0 {
-		// Reload the reply accumulated before the restart, then keep appending.
+	// Reload the latest turn's reply: an in-flight turn keeps appending to
+	// it, and a finished worker's last words stay quotable after a restart.
+	if w.meta.Turns > 0 {
 		resultPath := filepath.Join(w.dir, fmt.Sprintf("result%d.md", w.meta.Turns))
 		if b, err := os.ReadFile(resultPath); err == nil {
 			w.turnText.Write(b)
 			w.lastText = tailString(w.turnText.String(), 200)
 		}
 
-		if f, err := os.OpenFile(resultPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
-			w.turnFile = f
-		}
+		if callID != 0 {
+			if f, err := os.OpenFile(resultPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+				w.turnFile = f
+			}
 
-		w.turnStart = time.Now()
+			w.turnStart = time.Now()
+			w.recoverCalls()
+		}
 	}
 
 	w.mu.Unlock()
@@ -528,6 +618,75 @@ func (w *Worker) attach(client *acp.Client) {
 		w.mu.Unlock()
 
 		go w.runTurn(turnCtx, cancel, callID, sessionID, "")
+	}
+}
+
+// recoverCalls rebuilds the current turn's tool-call state from the event
+// journal after a reattach: the calls started since the last prompt and not
+// finished are in flight again, and the turn's counters cover the whole turn
+// rather than the part after the restart. A call's start record carries its
+// id and title under the tool's own kind; must hold mu.
+func (w *Worker) recoverCalls() {
+	f, err := os.Open(filepath.Join(w.dir, "events.jsonl"))
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+
+	var starts []toolCall
+
+	// latest is the time of the turn's last tool event, so the silence
+	// counters pick up where the previous daemon left them.
+	var latest time.Time
+
+	done := make(map[string]bool)
+
+	for sc.Scan() {
+		var ev struct {
+			TS     time.Time `json:"ts"`
+			Kind   string    `json:"kind"`
+			ID     string    `json:"id"`
+			Title  string    `json:"title"`
+			Target string    `json:"target"`
+		}
+
+		if json.Unmarshal(sc.Bytes(), &ev) != nil {
+			continue
+		}
+
+		switch {
+		case ev.Kind == "prompt":
+			starts = starts[:0]
+			clear(done)
+			latest = time.Time{}
+		case ev.Kind == "tool_done":
+			done[ev.ID] = true
+			latest = ev.TS
+		case ev.ID != "" && ev.Title != "":
+			starts = append(starts, toolCall{ID: ev.ID, Title: ev.Title, Kind: ev.Kind, Target: ev.Target, Started: ev.TS})
+			latest = ev.TS
+		}
+	}
+
+	if !latest.IsZero() {
+		w.lastEvent = latest
+	}
+
+	for _, call := range starts {
+		if !done[call.ID] {
+			w.inFlight[call.ID] = call
+		}
+
+		w.lastCall = call
+		w.turnCalls++
+		w.recent = append(w.recent, call.Title)
+
+		if len(w.recent) > 6 {
+			w.recent = w.recent[1:]
+		}
 	}
 }
 
@@ -616,6 +775,14 @@ func (w *Worker) onNotification(n acp.Notification) {
 				Amount   float64 `json:"amount"`
 				Currency string  `json:"currency"`
 			} `json:"cost"`
+			// RawInput is the tool's argument object; the keys that name a
+			// file, command, pattern or address are what a reader wants.
+			RawInput struct {
+				Path    string `json:"path"`
+				Command string `json:"command"`
+				Pattern string `json:"pattern"`
+				URL     string `json:"url"`
+			} `json:"rawInput"`
 			Content json.RawMessage
 		} `json:"update"`
 	}
@@ -633,14 +800,25 @@ func (w *Worker) onNotification(n acp.Notification) {
 
 	switch u.SessionUpdate {
 	case "tool_call":
-		w.inFlight[u.ToolCallID] = toolCall{ID: u.ToolCallID, Title: u.Title, Kind: u.Kind, Started: time.Now()}
+		in := u.RawInput
+		call := toolCall{ID: u.ToolCallID, Title: u.Title, Kind: u.Kind, Started: w.lastEvent}
+		call.Target = cmp.Or(in.Path, in.Command, in.Pattern, in.URL)
+		w.inFlight[u.ToolCallID] = call
+		w.lastCall = call
+		w.turnCalls++
+		w.calls.add(w.lastEvent)
 		w.recent = append(w.recent, u.Title)
 
 		if len(w.recent) > 6 {
 			w.recent = w.recent[1:]
 		}
 
-		w.event("tool_call", map[string]any{"id": u.ToolCallID, "title": u.Title, "kind": u.Kind})
+		fields := map[string]any{"id": u.ToolCallID, "title": u.Title, "kind": u.Kind}
+		if call.Target != "" {
+			fields["target"] = call.Target
+		}
+
+		w.event("tool_call", fields)
 	case "tool_call_update":
 		if u.Status == "completed" || u.Status == "failed" || u.Status == "cancelled" {
 			if tc, ok := w.inFlight[u.ToolCallID]; ok {
@@ -648,12 +826,24 @@ func (w *Worker) onNotification(n acp.Notification) {
 				delete(w.inFlight, u.ToolCallID)
 			}
 		}
-	case "agent_message_chunk":
+	case "agent_message_chunk", "agent_thought_chunk":
 		var c struct {
 			Text string `json:"text"`
 		}
 
-		if err := json.Unmarshal(u.Content, &c); err == nil && c.Text != "" {
+		if err := json.Unmarshal(u.Content, &c); err != nil || c.Text == "" {
+			return
+		}
+
+		w.narration.WriteString(c.Text)
+
+		if w.narration.Len() > 4*narrationKeep {
+			tail := tailString(w.narration.String(), narrationKeep)
+			w.narration.Reset()
+			w.narration.WriteString(tail)
+		}
+
+		if u.SessionUpdate == "agent_message_chunk" {
 			w.turnText.WriteString(c.Text)
 
 			if w.turnFile != nil {
@@ -670,6 +860,7 @@ func (w *Worker) onNotification(n acp.Notification) {
 
 		if u.Cost != nil {
 			w.meta.CostUSD = u.Cost.Amount
+			w.meta.CostAt = w.lastEvent
 		}
 
 		w.saveMeta()
@@ -807,16 +998,161 @@ func (w *Worker) releaseIdle(now time.Time) bool {
 	return true
 }
 
-// Now describes what the worker is doing, plus any flag.
+// refreshUsage folds the replies the session journal has gained since the
+// last call into the worker's cost and token figures. A running turn is the
+// only time the journal is ahead of what the agent has reported.
+func (w *Worker) refreshUsage(now time.Time) {
+	w.mu.Lock()
+	state, sessionID, path, offset := w.meta.State, w.meta.SessionID, w.live.path, w.live.offset
+	w.mu.Unlock()
+
+	if state != StateRunning || sessionID == "" {
+		return
+	}
+
+	if path == "" {
+		if path = w.journalPath(sessionID); path == "" {
+			return
+		}
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return
+	}
+
+	// A journal shorter than where it was last read has been rewritten;
+	// start over on it.
+	reset := st.Size() < offset
+	if reset {
+		offset = 0
+	}
+
+	if st.Size() == offset {
+		return
+	}
+
+	buf := make([]byte, st.Size()-offset)
+
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && n == 0 {
+		return
+	}
+
+	// Only whole lines count; the last one may still be being written.
+	end := bytes.LastIndexByte(buf[:n], '\n')
+	if end < 0 {
+		return
+	}
+
+	cost, tokens := journalUsage(buf[:end])
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if reset {
+		w.live.cost, w.live.tokens = 0, 0
+	}
+
+	w.live.path = path
+	w.live.offset = offset + int64(end) + 1
+	w.live.cost += cost
+	w.live.tokens += tokens
+
+	if w.live.cost > w.meta.CostUSD {
+		w.meta.CostUSD = w.live.cost
+		w.meta.CostAt = now
+	}
+}
+
+// journalUsage sums the cost and tokens of the assistant replies in a run of
+// whole session journal lines.
+func journalUsage(lines []byte) (cost float64, tokens int64) {
+	for line := range bytes.SplitSeq(lines, []byte{'\n'}) {
+		if !bytes.Contains(line, []byte(`"assistant"`)) || !bytes.Contains(line, []byte(`"usage"`)) {
+			continue
+		}
+
+		var rec struct {
+			Type    string `json:"type"`
+			Message struct {
+				Role  string `json:"role"`
+				Usage struct {
+					Input      int64 `json:"input"`
+					Output     int64 `json:"output"`
+					CacheRead  int64 `json:"cacheRead"`
+					CacheWrite int64 `json:"cacheWrite"`
+					Cost       struct {
+						Total float64 `json:"total"`
+					} `json:"cost"`
+				} `json:"usage"`
+			} `json:"message"`
+		}
+
+		if json.Unmarshal(line, &rec) != nil || rec.Type != "message" || rec.Message.Role != "assistant" {
+			continue
+		}
+
+		u := rec.Message.Usage
+		cost += u.Cost.Total
+		tokens += u.Input + u.Output + u.CacheRead + u.CacheWrite
+	}
+
+	return cost, tokens
+}
+
+// journalPath finds the session journal omp keeps for the worker's session:
+// <agent dir>/sessions/<tree>/<time>_<session id>.jsonl, under the agent
+// directory the agent definition, the environment or omp's default names.
+func (w *Worker) journalPath(sessionID string) string {
+	dir := filepath.Join(w.home, ".omp", "agent")
+
+	if env := os.Getenv("PI_CODING_AGENT_DIR"); env != "" {
+		dir = env
+	}
+
+	for _, kv := range w.agent.Env {
+		if v, ok := strings.CutPrefix(kv, "PI_CODING_AGENT_DIR="); ok {
+			dir = v
+		}
+	}
+
+	matches, _ := filepath.Glob(filepath.Join(dir, "sessions", "*", "*_"+sessionID+".jsonl"))
+	if len(matches) == 0 {
+		return ""
+	}
+
+	return matches[0]
+}
+
+// Now describes what the worker is doing, plus any flag. Tool, Title and
+// Target name the oldest tool call in flight, when there is one. Since is
+// how long that call has run, or, with nothing in flight, how long the
+// worker has been silent since its last event or its prompt.
 type Now struct {
-	Line string
-	Flag string
+	Line   string
+	Flag   string
+	Tool   string
+	Title  string
+	Target string
+	Since  time.Duration
 }
 
 func (w *Worker) now() Now {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	return w.nowLocked()
+}
+
+// nowLocked is now for a caller that already holds mu.
+func (w *Worker) nowLocked() Now {
 	var n Now
 
 	if w.meta.State != StateRunning {
@@ -828,6 +1164,7 @@ func (w *Worker) now() Now {
 	}
 
 	since := time.Since(w.turnStart)
+	n.Since = since
 
 	if w.lastEvent.IsZero() {
 		n.Line = fmt.Sprintf("no event yet, %s since prompt", fmtDur(since))
@@ -847,14 +1184,25 @@ func (w *Worker) now() Now {
 			}
 		}
 
-		n.Line = fmt.Sprintf("in %s for %s", truncate(oldest.Title, 90), fmtDur(time.Since(oldest.Started)))
+		n.Tool = oldest.Kind
+		n.Title = oldest.Title
+		n.Target = oldest.Target
+		n.Since = time.Since(oldest.Started)
+		n.Line = fmt.Sprintf("in %s for %s", truncate(oldest.Title, 90), fmtDur(n.Since))
 	} else {
 		idle := time.Since(w.lastEvent)
+		n.Since = idle
 		n.Line = fmt.Sprintf("silent %s, no tool call in flight", fmtDur(idle))
 
 		if idle > 900*time.Second {
 			n.Flag = "STALLED"
 		}
+	}
+
+	// A seat that has read nothing after ten minutes is reasoning about files
+	// it never opened; its report, if one comes, is not grounded in the tree.
+	if n.Flag == "" && !w.agent.Bare && w.turnCalls == 0 && since > noToolsAfter {
+		n.Flag = "NO-TOOLS"
 	}
 
 	if n.Flag == "" && len(w.recent) >= 4 {

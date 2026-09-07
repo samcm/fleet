@@ -234,6 +234,16 @@ func (c *Client) Statuses(ctx context.Context) ([]Status, error) {
 	return out, nil
 }
 
+// Dashboard returns the daemon's status-wall snapshot as JSON.
+func (c *Client) Dashboard(ctx context.Context) ([]byte, error) {
+	body, err := c.get(ctx, "/dashboard", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return []byte(body), nil
+}
+
 // Watch prints one line per state change or flag until every watched worker is
 // final or timeout passes. With no ids it watches every worker live at start.
 func (c *Client) Watch(ctx context.Context, ids []string, timeout time.Duration, out io.Writer) error {

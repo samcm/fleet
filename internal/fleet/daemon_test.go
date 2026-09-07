@@ -163,6 +163,129 @@ func waitFinal(t *testing.T, d *Daemon, id string, timeout time.Duration) Meta {
 	return m
 }
 
+func TestSpawnAccountPool(t *testing.T) {
+	const envKey = "OMP_AUTH_BROKER_ACCOUNT_POOL_FILE"
+	t.Setenv(envKey, "")
+	if err := os.Unsetenv(envKey); err != nil {
+		t.Fatal(err)
+	}
+
+	d, home := newTestDaemon(t)
+	const identity = "email:worker@example.com|org:test-org"
+	agent := d.agents["fake"]
+	agent.Env = make([]string, 2, 4)
+	agent.Env[0] = "HOME=" + filepath.Join(Root(home), "barehome")
+	agent.Env[1] = "PI_CODING_AGENT_DIR=" + filepath.Join(Root(home), "bareagent")
+	d.agents["fake"] = agent
+	const config = "accounts:\n  worker:\n    provider: test\n    identity: " + identity + "\n"
+	path := filepath.Join(Root(home), "accounts.yaml")
+	if err := os.WriteFile(path, []byte(config+"defaults:\n  test: worker\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	id := spawnFake(t, d, "duration=100ms permdelay=10ms accountpool=1", true)
+	m := waitFinal(t, d, id, waitTimeout)
+	if m.State != StateDone {
+		t.Fatalf("pinned worker: %s (%s)", m.State, m.Detail)
+	}
+
+	wk, err := d.worker(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reply := wk.Result()
+	if !strings.Contains(reply, "accountpool-present=true") {
+		t.Fatalf("agent did not receive pool environment: %s", reply)
+	}
+
+	var poolPath string
+
+	for _, want := range []string{"home=" + filepath.Join(Root(home), "barehome"), "agentdir=" + filepath.Join(Root(home), "bareagent")} {
+		if !strings.Contains(reply, want+" ") {
+			t.Errorf("agent environment missing %q: %s", want, reply)
+		}
+	}
+	for _, token := range strings.Fields(reply) {
+		if value, ok := strings.CutPrefix(token, "accountpool="); ok {
+			poolPath = value
+		}
+	}
+
+	if !filepath.IsAbs(poolPath) || poolPath != filepath.Join(Root(home), "workers", id, "accounts.json") {
+		t.Fatalf("unexpected pool path %q", poolPath)
+	}
+
+	data, err := os.ReadFile(poolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var pool map[string][]string
+	if err := json.Unmarshal(data, &pool); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pool) != 1 || len(pool["test"]) != 1 || pool["test"][0] != identity {
+		t.Fatalf("unexpected pool: %s", data)
+	}
+
+	info, err := os.Stat(poolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("pool mode %o, want 600", info.Mode().Perm())
+	}
+
+	data, err = os.ReadFile(filepath.Join(Root(home), "workers", id, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var persisted Meta
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+
+	if persisted.Spec.Account != "worker" || persisted.AccountIdentity != identity {
+		t.Fatalf("persisted account = %q, identity = %q", persisted.Spec.Account, persisted.AccountIdentity)
+	}
+
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	unpinnedID := spawnFake(t, d, "duration=100ms permdelay=10ms accountpool=1", true)
+	unpinned := waitFinal(t, d, unpinnedID, waitTimeout)
+	if unpinned.State != StateDone || unpinned.Spec.Account != "" || unpinned.AccountIdentity != "" {
+		t.Fatalf("unpinned worker: %+v", unpinned)
+	}
+
+	unpinnedWorker, err := d.worker(unpinnedID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if reply := unpinnedWorker.Result(); !strings.Contains(reply, "accountpool= accountpool-present=false") {
+		t.Fatalf("unpinned agent received pool environment: %s", reply)
+	}
+
+	for _, test := range []struct {
+		id      string
+		account string
+	}{{id, "worker"}, {unpinnedID, "-"}} {
+		lines := strings.Split(d.Ls(true, test.id), "\n")
+		fields := strings.Fields(lines[1])
+		if len(fields) < 8 || fields[6] != test.account {
+			t.Errorf("ls account = %q, want %q", lines[1], test.account)
+		}
+	}
+
+	t.Log(strings.Split(d.Ls(true, id), "\n")[0])
+}
+
 // TestSpawnWaitResult covers one full turn: reply text, per-turn usage and
 // the live usage_update figures.
 func TestSpawnWaitResult(t *testing.T) {
