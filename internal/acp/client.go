@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -200,7 +201,9 @@ func Launch(hostArgv []string, workerdir string, launch LaunchSpec) (*Client, er
 		return nil, fmt.Errorf("start host: %w", err)
 	}
 
-	_ = cmd.Process.Release()
+	// The host is in its own session and outlives this process. Waiting on
+	// it only reaps the exit status, so a finished host is not left a zombie.
+	go func() { _ = cmd.Wait() }()
 
 	deadline := time.Now().Add(10 * time.Second)
 
@@ -223,6 +226,27 @@ func Launch(hostArgv []string, workerdir string, launch LaunchSpec) (*Client, er
 // before the loss; their replayed responses are routed to Expect channels.
 func Attach(workerdir string, resumeSeq int64, expect ...int64) (*Client, error) {
 	return connect(workerdir, resumeSeq, expect)
+}
+
+// KillHost attaches to a worker's host only to end its agent, and waits up to
+// wait for the exit. It reports whether a host answered: one that does not is
+// already gone, which is the outcome the caller wants. Nothing is replayed,
+// since a client that only kills has no use for the stream.
+func KillHost(workerdir string, wait time.Duration) (bool, error) {
+	client, err := connect(workerdir, math.MaxInt64, nil)
+	if err != nil {
+		return false, nil //nolint:nilerr // no host answers: nothing to kill
+	}
+	defer client.Close()
+
+	client.Kill()
+
+	select {
+	case <-client.Done():
+		return true, nil
+	case <-time.After(wait):
+		return true, fmt.Errorf("kill host: agent of %s did not exit within %s", workerdir, wait)
+	}
 }
 
 // Notifications delivers agent notifications in stream order. Closed when the
