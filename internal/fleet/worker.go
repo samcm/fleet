@@ -115,7 +115,13 @@ type Worker struct {
 	stderrPath string
 	events     *os.File
 	closed     bool
+	released   bool
 }
+
+// idleAfter is how long a finished worker keeps its agent for a follow-up.
+// After that the daemon releases it: the process ends, the files and the ls
+// entry stay, and fleet say asks for a new worker.
+const idleAfter = time.Hour
 
 var quotaPattern = regexp.MustCompile(`(?i)usage limit|out of credits|need a Grok subscription|insufficient_quota|billing|rate.?limit`)
 
@@ -720,7 +726,12 @@ func (w *Worker) Say(text string) (string, error) {
 	w.mu.Lock()
 
 	if w.closed {
+		released := w.released
 		w.mu.Unlock()
+
+		if released {
+			return "", fmt.Errorf("agent released after %dm idle; spawn a new worker", int(idleAfter.Minutes()))
+		}
 
 		return "", errors.New("agent process has exited; spawn a new worker")
 	}
@@ -765,6 +776,35 @@ func (w *Worker) Stop() {
 	}
 
 	time.AfterFunc(5*time.Second, client.Kill)
+}
+
+// releaseIdle ends the agent of a worker that has sat DONE or TIMEOUT for
+// idleAfter with nothing queued, and reports whether it did. The state, the
+// files and the ls entry stay; only the process goes.
+func (w *Worker) releaseIdle(now time.Time) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.closed || w.client == nil || w.pendingSay != "" {
+		return false
+	}
+
+	if w.meta.State != StateDone && w.meta.State != StateTimeout {
+		return false
+	}
+
+	if w.meta.Ended.IsZero() || now.Sub(w.meta.Ended) < idleAfter {
+		return false
+	}
+
+	w.closed = true
+	w.released = true
+	w.meta.Detail += fmt.Sprintf("; released after %dm idle", int(idleAfter.Minutes()))
+	w.saveMeta()
+	w.event("released", map[string]any{"idle": fmtDur(now.Sub(w.meta.Ended))})
+	w.client.Kill()
+
+	return true
 }
 
 // Now describes what the worker is doing, plus any flag.

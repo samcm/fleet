@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -68,6 +69,14 @@ type host struct {
 
 	shutdownCh  chan struct{}
 	shutdownNow sync.Once
+
+	// exitedCh closes once the agent has exited and its tree is swept.
+	exitedCh chan struct{}
+
+	// doomed lists the agent's descendants at the moment a kill order went
+	// out. They reparent to init when the agent exits, so they are found
+	// before and swept after.
+	doomed []int
 }
 
 // ServeHost runs the agent described by <workerdir>/launch.json and serves it
@@ -88,7 +97,7 @@ func ServeHost(ctx context.Context, workerdir string) error {
 		return errors.New("launch.json: empty argv")
 	}
 
-	h := &host{dir: workerdir, shutdownCh: make(chan struct{})}
+	h := &host{dir: workerdir, shutdownCh: make(chan struct{}), exitedCh: make(chan struct{})}
 
 	if err := h.startAgent(launch); err != nil {
 		return err
@@ -109,9 +118,13 @@ func ServeHost(ctx context.Context, workerdir string) error {
 
 	go func() {
 		<-ctx.Done()
+		h.term()
 
-		if h.cmd.Process != nil {
-			_ = syscall.Kill(-h.cmd.Process.Pid, syscall.SIGTERM)
+		// Stay for the sweep of the agent's tree; leaving early would leave
+		// the tree behind.
+		select {
+		case <-h.exitedCh:
+		case <-time.After(termGrace + 5*time.Second):
 		}
 
 		h.shutdown()
@@ -134,7 +147,7 @@ func ServeHost(ctx context.Context, workerdir string) error {
 }
 
 // startAgent launches the agent exactly once, in its own process group so a
-// kill order can signal the whole tree.
+// kill order reaches everything that stays in it.
 func (h *host) startAgent(launch LaunchSpec) error {
 	stderr, err := os.OpenFile(launch.StderrPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -220,6 +233,8 @@ func (h *host) waitAgent() {
 	h.mu.Unlock()
 
 	h.log("agent exited: %v", err)
+	h.sweep()
+	close(h.exitedCh)
 
 	if h.deliverExit() {
 		h.shutdown()
@@ -369,9 +384,7 @@ func (h *host) readDaemon(conn net.Conn, scanner *bufio.Scanner) {
 			h.mu.Unlock()
 
 			if !exited {
-				if h.cmd.Process != nil {
-					_ = syscall.Kill(-h.cmd.Process.Pid, syscall.SIGTERM)
-				}
+				h.term()
 
 				break // the agent's exit is delivered through the usual path
 			}
@@ -428,4 +441,120 @@ func (h *host) shutdown() {
 		_ = h.journal.Close()
 		_ = h.stderr.Close()
 	})
+}
+
+// termGrace is how long the agent's tree gets to leave on SIGTERM before it
+// is killed outright.
+const termGrace = 15 * time.Second
+
+// term asks the agent's tree to exit and, if the agent is still there after
+// termGrace, kills it outright.
+func (h *host) term() {
+	h.killAgent(syscall.SIGTERM)
+
+	time.AfterFunc(termGrace, func() {
+		h.mu.Lock()
+		exited := h.exited
+		h.mu.Unlock()
+
+		if !exited {
+			h.log("agent ignored SIGTERM for %s; sending SIGKILL", termGrace)
+			h.killAgent(syscall.SIGKILL)
+		}
+	})
+}
+
+// killAgent signals the agent's process group and every process under the
+// agent. omp starts some of its workers in their own process groups, so the
+// group signal alone leaves them behind; they are listed while the agent is
+// still their ancestor and remembered for sweep.
+func (h *host) killAgent(sig syscall.Signal) {
+	if h.cmd.Process == nil {
+		return
+	}
+
+	pid := h.cmd.Process.Pid
+	tree := descendants(pid)
+
+	h.mu.Lock()
+	h.doomed = append(h.doomed, tree...)
+	h.mu.Unlock()
+
+	_ = syscall.Kill(-pid, sig)
+
+	for _, p := range tree {
+		_ = syscall.Kill(p, sig)
+	}
+}
+
+// sweep waits briefly for the processes killAgent listed to follow the
+// agent out, then kills the ones that did not.
+func (h *host) sweep() {
+	h.mu.Lock()
+	doomed := h.doomed
+	h.doomed = nil
+	h.mu.Unlock()
+
+	deadline := time.Now().Add(3 * time.Second)
+
+	for time.Now().Before(deadline) {
+		if len(alive(doomed)) == 0 {
+			return
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	for _, p := range alive(doomed) {
+		h.log("process %d outlived the agent; killing it", p)
+		_ = syscall.Kill(p, syscall.SIGKILL)
+	}
+}
+
+// alive keeps the pids the kernel still knows.
+func alive(pids []int) []int {
+	var out []int
+
+	for _, p := range pids {
+		if err := syscall.Kill(p, 0); err == nil || errors.Is(err, syscall.EPERM) {
+			out = append(out, p)
+		}
+	}
+
+	return out
+}
+
+// descendants lists every live process under pid from one ps snapshot; ps is
+// the process table both macOS and Linux expose.
+func descendants(pid int) []int {
+	out, err := exec.Command("ps", "-axo", "pid=,ppid=").Output()
+	if err != nil {
+		return nil
+	}
+
+	children := make(map[int][]int)
+
+	for _, line := range strings.Split(string(out), "\n") {
+		var p, pp int
+		if _, err := fmt.Sscan(line, &p, &pp); err != nil {
+			continue
+		}
+
+		children[pp] = append(children[pp], p)
+	}
+
+	var tree []int
+
+	queue := []int{pid}
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+
+		for _, c := range children[p] {
+			tree = append(tree, c)
+			queue = append(queue, c)
+		}
+	}
+
+	return tree
 }

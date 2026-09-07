@@ -114,7 +114,8 @@ func Run(ctx context.Context, home, version string) error {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "fleet_say",
 		Description: "Send a follow-up prompt into the worker's live session: review findings to fix, a correction, or 'continue'. " +
-			"Runs at once if the worker is idle, otherwise queues behind the current turn. Keeps the worker's context and cache; far cheaper than a new worker.",
+			"Runs at once if the worker is idle, otherwise queues behind the current turn. Keeps the worker's context and cache; far cheaper than a new worker. " +
+			"A worker idle for an hour after its last turn has been released and says so; spawn a new one then.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in sayInput) (*mcp.CallToolResult, any, error) {
 		return text(client.Say(ctx, in.ID, in.Message))
 	})

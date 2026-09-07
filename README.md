@@ -92,7 +92,7 @@ Final: `DONE`, `TIMEOUT`, `STOPPED`, `FAILED`, `QUOTA`. `DONE` means the worker 
 
 Flags on a running worker: `NO-TURN` (no event for 180s), `STALLED` (900s silent with no tool call in flight), `LOOPING` (same tool title in four of the last six calls).
 
-`FAILED` or `QUOTA` in the first status line is the launch dying — unknown model, unsupported effort, auth, or a provider limit. Fix the spec rather than retrying it unchanged. After launch, `fleet log <id>` and `~/.fleet/workers/<id>/stderr.log` have the detail. `TIMEOUT` keeps its result and its context, so `fleet say "continue"` is usually better than respawning.
+`FAILED` or `QUOTA` in the first status line is the launch dying — unknown model, unsupported effort, auth, or a provider limit. Fix the spec rather than retrying it unchanged. After launch, `fleet log <id>` and `~/.fleet/workers/<id>/stderr.log` have the detail. `TIMEOUT` keeps its result and its context, so `fleet say "continue"` is usually better than respawning. A worker that sits `DONE` or `TIMEOUT` for an hour with no follow-up is released: its agent process ends, its files and its `fleet ls --all` entry stay, and `fleet say` then asks for a new worker.
 
 ## Shared trees
 
@@ -133,7 +133,7 @@ Built-ins: `omp`, the normal worker with tools, and `oracle`, a toolless one-sho
 
 Each worker's agent runs under its own detached host process (`fleet host <workerdir>`), so restarting the daemon does not kill live workers.
 
-The host journals agent stdout to `acp.jsonl` with a stream position and forwards it to the daemon. The worker persists the position it has handled (`ack_seq`) plus the in-flight prompt's call id and deadline. A restarted daemon dials `host.sock`, sends `{"resume":N}`, and the host replays past that point before going live, so the turn's response and any permission requests in the gap are handled exactly once. A worker whose host is gone is marked `FAILED`.
+The host journals agent stdout to `acp.jsonl` with a stream position and forwards it to the daemon. The worker persists the position it has handled (`ack_seq`) plus the in-flight prompt's call id and deadline. A restarted daemon dials `host.sock`, sends `{"resume":N}`, and the host replays past that point before going live, so the turn's response and any permission requests in the gap are handled exactly once. A worker whose host is gone is marked `FAILED`; a worker the daemon gives up on at startup has its host ended.
 
 ## Development
 

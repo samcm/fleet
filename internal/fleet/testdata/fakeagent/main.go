@@ -4,15 +4,20 @@
 // session/set_config_option, session/cancel and session/prompt; a prompt
 // emits message chunks and one usage_update, asks one edit permission
 // mid-turn, sleeps for a duration named in the prompt text, and answers with
-// end_turn and a usage object.
+// end_turn and a usage object. detach=1 in the prompt starts a child in its
+// own session and names its pid, standing in for the tool processes omp
+// starts detached.
 package main
 
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -143,6 +148,15 @@ func runPrompt(id json.RawMessage, params json.RawMessage) {
 
 	if tag := field(text, "tag="); tag != "" {
 		chunk("tag=" + tag + " ")
+	}
+
+	if field(text, "detach=") != "" {
+		child := exec.Command("sleep", "300")
+		child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+		if err := child.Start(); err == nil {
+			chunk(fmt.Sprintf("child=%d ", child.Process.Pid))
+		}
 	}
 
 	notify("session/update", map[string]any{"sessionId": "s1", "update": map[string]any{

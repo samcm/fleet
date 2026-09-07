@@ -9,10 +9,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/samcm/fleet/internal/acp"
 )
 
 var (
@@ -74,6 +79,7 @@ func newTestDaemon(t *testing.T) (*Daemon, string) {
 	}
 
 	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Cleanup(func() { killHosts(t, home) })
 
 	if err := os.MkdirAll(Root(home), 0o755); err != nil {
 		t.Fatal(err)
@@ -417,4 +423,154 @@ func TestWaitEndpoint(t *testing.T) {
 	if !strings.Contains(entry, "DONE") {
 		t.Errorf("wait returned before the worker was DONE:\n%s", entry)
 	}
+}
+
+// killHosts ends every worker host under home so a test leaves no agent
+// behind. Cleanups run last-registered first, so it runs before the home is
+// removed.
+func killHosts(t *testing.T, home string) {
+	t.Helper()
+
+	entries, _ := os.ReadDir(filepath.Join(Root(home), "workers"))
+	for _, e := range entries {
+		if _, err := acp.KillHost(filepath.Join(Root(home), "workers", e.Name()), waitTimeout); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	}
+}
+
+func released(wk *Worker) bool {
+	wk.mu.Lock()
+	defer wk.mu.Unlock()
+
+	return wk.released
+}
+
+func processGone(pid int) bool { return syscall.Kill(pid, 0) != nil }
+
+// TestIdleWorkerReleased proves a finished worker's agent is ended once it
+// has sat idle for idleAfter, and not before: the state, the reply and the
+// ls entry stay, and say asks for a new worker.
+func TestIdleWorkerReleased(t *testing.T) {
+	d, _ := newTestDaemon(t)
+
+	id := spawnFake(t, d, "duration=300ms permdelay=50ms tag=one", true)
+
+	if m := waitFinal(t, d, id, 30*time.Second); m.State != StateDone {
+		t.Fatalf("state %s (%s), want DONE", m.State, m.Detail)
+	}
+
+	wk, err := d.worker(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	agent := wk.Meta().PID
+
+	d.releaseIdleAt(time.Now().Add(idleAfter / 2))
+
+	if released(wk) {
+		t.Fatal("released before idleAfter")
+	}
+
+	d.releaseIdleAt(time.Now().Add(idleAfter + time.Minute))
+
+	if !released(wk) {
+		t.Fatal("not released after idleAfter")
+	}
+
+	waitFor(t, waitTimeout, func() bool { return processGone(agent) }, "agent to exit")
+
+	m := wk.Meta()
+	if m.State != StateDone || !strings.Contains(m.Detail, "released after") {
+		t.Errorf("after release: state %s detail %q", m.State, m.Detail)
+	}
+
+	if _, err := wk.Say("continue"); err == nil || !strings.Contains(err.Error(), "released") {
+		t.Errorf("say after release: %v, want a released error", err)
+	}
+
+	if text := wk.Result(); !strings.Contains(text, "tag=one") {
+		t.Errorf("reply lost after release:\n%s", text)
+	}
+
+	if ls := d.Ls(true, id); !strings.Contains(ls, "DONE") || !strings.Contains(ls, "released after") {
+		t.Errorf("ls entry after release:\n%s", ls)
+	}
+}
+
+// TestStopKillsDetachedChild proves ending a worker also ends a process the
+// agent started outside its process group.
+func TestStopKillsDetachedChild(t *testing.T) {
+	d, _ := newTestDaemon(t)
+
+	id := spawnFake(t, d, "duration=20s permdelay=50ms detach=1", true)
+
+	wk, err := d.worker(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	childPattern := regexp.MustCompile(`child=(\d+)`)
+
+	var child int
+
+	waitFor(t, waitTimeout, func() bool {
+		m := childPattern.FindStringSubmatch(wk.Result())
+		if m == nil {
+			return false
+		}
+
+		child, _ = strconv.Atoi(m[1])
+
+		return child > 0
+	}, "detached child pid")
+
+	if processGone(child) {
+		t.Fatalf("child %d is not running", child)
+	}
+
+	wk.Stop()
+
+	waitFor(t, waitTimeout, func() bool { return processGone(child) }, "detached child to be killed")
+}
+
+// TestResumeFailureKillsHost proves a daemon that gives up on a worker at
+// startup also ends the host it will never talk to.
+func TestResumeFailureKillsHost(t *testing.T) {
+	d1, home := newTestDaemon(t)
+	stop1 := startServe(t, d1)
+
+	id := spawnFake(t, d1, "duration=300ms permdelay=50ms", true)
+
+	m := waitFinal(t, d1, id, 30*time.Second)
+	if m.State != StateDone {
+		t.Fatalf("state %s (%s), want DONE", m.State, m.Detail)
+	}
+
+	stop1()
+
+	// As if the previous daemon had died during the launch handshake.
+	m.State = StateStarting
+
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(Root(home), "workers", id, "meta.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d2 := newDaemonOn(t, home)
+
+	d2.mu.Lock()
+	hist, ok := d2.history[id]
+	d2.mu.Unlock()
+
+	if !ok || hist.State != StateFailed {
+		t.Fatalf("worker %s: in history %v, state %s; want FAILED", id, ok, hist.State)
+	}
+
+	waitFor(t, waitTimeout, func() bool { return processGone(m.PID) }, "agent of the failed worker to exit")
 }

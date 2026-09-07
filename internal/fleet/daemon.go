@@ -150,6 +150,14 @@ func (d *Daemon) failResume(dir string, m Meta, detail string) {
 	}
 
 	d.history[m.ID] = m
+
+	// The host may still be running an agent this daemon will never talk to.
+	// Ending it is off the startup path and bounded by hostKillWait.
+	go func() {
+		if _, err := acp.KillHost(dir, hostKillWait); err != nil {
+			d.logger.Warn("host of a failed worker did not exit", slog.String("worker", m.ID), slog.String("err", err.Error()))
+		}
+	}()
 }
 
 // Serve listens on the unix socket until ctx is cancelled.
@@ -192,6 +200,8 @@ func (d *Daemon) Serve(ctx context.Context) error {
 
 	d.logger.Info("fleet daemon listening", slog.String("socket", sock))
 
+	go d.releaseIdle(ctx)
+
 	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -205,6 +215,48 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	d.mu.Unlock()
 
 	return nil
+}
+
+// releaseEvery is how often the daemon looks for finished workers whose
+// agents have sat idle past idleAfter.
+const releaseEvery = time.Minute
+
+// hostKillWait bounds how long the daemon waits for a host it has given up
+// on to end its agent.
+const hostKillWait = 30 * time.Second
+
+// releaseIdle ends the agent of every worker that has sat finished for
+// idleAfter, so idle sessions do not pile up in memory. It runs until ctx
+// ends.
+func (d *Daemon) releaseIdle(ctx context.Context) {
+	ticker := time.NewTicker(releaseEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			d.releaseIdleAt(now)
+		}
+	}
+}
+
+// releaseIdleAt is one pass of releaseIdle, judging idleness against now.
+func (d *Daemon) releaseIdleAt(now time.Time) {
+	d.mu.Lock()
+	workers := make([]*Worker, 0, len(d.workers))
+
+	for _, wk := range d.workers {
+		workers = append(workers, wk)
+	}
+	d.mu.Unlock()
+
+	for _, wk := range workers {
+		if wk.releaseIdle(now) {
+			d.logger.Info("released idle worker", slog.String("worker", wk.Meta().ID))
+		}
+	}
 }
 
 func writeErr(w http.ResponseWriter, code int, err error) {
