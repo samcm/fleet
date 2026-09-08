@@ -85,10 +85,6 @@ func TestBuildSeriesSpreadsTurnsAndDedupesConcurrency(t *testing.T) {
 		t.Errorf("opus spend last=%.4f prev=%.4f, want 1.25 (two turns plus the running turn's 0.25) and 0", s.Spend[last][opus], s.Spend[last-1][opus])
 	}
 
-	if got := spentSince(spans, now.Add(-30*time.Minute)); math.Abs(got-3.25) > 1e-9 {
-		t.Errorf("spent in the last half hour %.4f, want 3.25 (c ended earlier)", got)
-	}
-
 	if math.Abs(s.Spend[last][k3]-0.5) > 1e-9 || math.Abs(s.Spend[41][k3]-2) > 1e-9 || s.Tokens[last][k3] != 7000 {
 		t.Errorf("k3 last bin spend=%.4f tokens=%d, bin41 spend=%.4f; want 0.5 and 7000 (d's running turn) and 2.0 (c untouched)", s.Spend[last][k3], s.Tokens[last][k3], s.Spend[41][k3])
 	}
@@ -158,8 +154,8 @@ func TestDashboardReportsFinishedTurn(t *testing.T) {
 		t.Errorf("row activity line=%q tool=%q live=%v", row.Line, row.Tool, row.ToolLive)
 	}
 
-	if dash.SpentToday != 7.0859 || dash.Started.IsZero() {
-		t.Errorf("spent today %v started %v", dash.SpentToday, dash.Started)
+	if dash.Started.IsZero() {
+		t.Errorf("started %v, want the daemon's start time", dash.Started)
 	}
 
 	s := dash.Series

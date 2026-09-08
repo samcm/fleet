@@ -622,7 +622,9 @@
     const spendBins = Array.isArray(series.spend) ? series.spend : [];
     const spendTotals = rowTotals(spendBins);
     const perModel = models.map((_, j) => spendBins.reduce((a, bin) => a + num(Array.isArray(bin) ? bin[j] : 0), 0));
-    dom.spendNow.textContent = money(spendTotals.reduce((a, b) => a + b, 0));
+    const spent = money(spendTotals.reduce((a, b) => a + b, 0));
+    dom.spendNow.textContent = spent;
+    dom.spent.textContent = spent;
     renderBars(dom.spendBars, spendBins, spendTotals);
     renderLegend(dom.spendLegend, models, perModel);
 
@@ -650,7 +652,6 @@
     dom.running.textContent = String(running);
     dom.flagged.textContent = String(flagged);
     dom.flagged.classList.toggle('raised', flagged > 0);
-    dom.spent.textContent = money(data.spent_today);
     dom.uptime.textContent = 'daemon up ' + uptimeText(data.started, Date.now() + skewMs);
   };
 

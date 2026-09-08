@@ -169,13 +169,10 @@ type Series struct {
 
 // Dashboard is the snapshot behind the status wall.
 type Dashboard struct {
-	Now     time.Time `json:"now"`
-	Started time.Time `json:"started"`
-	// SpentToday is the cost of the turns that ended since local midnight,
-	// plus whatever running turns have reported.
-	SpentToday float64           `json:"spent_today"`
-	Workers    []DashboardWorker `json:"workers"`
-	Series     Series            `json:"series"`
+	Now     time.Time         `json:"now"`
+	Started time.Time         `json:"started"`
+	Workers []DashboardWorker `json:"workers"`
+	Series  Series            `json:"series"`
 }
 
 // dashboard snapshots the worker for the status wall.
@@ -241,12 +238,10 @@ func firstLine(reply string) string {
 func (d *Daemon) Dashboard() Dashboard {
 	now := time.Now()
 	cutoff := now.Add(-dayWindow)
-	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 
 	var (
 		rows  []DashboardWorker
 		spans []turnSpan
-		spent float64
 	)
 
 	d.mu.Lock()
@@ -263,9 +258,7 @@ func (d *Daemon) Dashboard() Dashboard {
 			liveTokens = row.Tokens - (m.Usage.Input + m.Usage.CachedRead + m.Usage.Output)
 		}
 
-		first := len(spans)
 		spans = appendTurnSpans(spans, m, inFlight, liveTokens, now)
-		spent += spentSince(spans[first:], midnight)
 
 		if m.State.Terminal() && now.Sub(m.Ended) > 30*time.Minute {
 			continue
@@ -275,13 +268,11 @@ func (d *Daemon) Dashboard() Dashboard {
 	}
 
 	for _, m := range d.history {
-		if !m.Ended.After(cutoff) && !m.Ended.After(midnight) {
+		if !m.Ended.After(cutoff) {
 			continue
 		}
 
-		first := len(spans)
 		spans = appendTurnSpans(spans, m, time.Time{}, 0, now)
-		spent += spentSince(spans[first:], midnight)
 	}
 
 	d.mu.Unlock()
@@ -299,7 +290,7 @@ func (d *Daemon) Dashboard() Dashboard {
 	}
 
 	return Dashboard{
-		Now: now, Started: d.started, SpentToday: spent, Workers: rows,
+		Now: now, Started: d.started, Workers: rows,
 		Series: buildSeries(spans, d.calls.snapshot(now.Add(-hourWindow)), now),
 	}
 }
@@ -372,20 +363,6 @@ func appendTurnSpans(spans []turnSpan, m Meta, inFlight time.Time, liveTokens in
 	}
 
 	return spans
-}
-
-// spentSince totals the cost of the spans that ended at or after since. A
-// running span ends now, so its reported cost counts.
-func spentSince(spans []turnSpan, since time.Time) float64 {
-	var total float64
-
-	for _, sp := range spans {
-		if !sp.end.Before(since) {
-			total += sp.cost
-		}
-	}
-
-	return total
 }
 
 // spread visits every one of the n bins of width bin from start that sp
